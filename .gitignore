@@ -1,2 +1,4 @@
 .env
 repo_config.json
+*.crt
+*.key

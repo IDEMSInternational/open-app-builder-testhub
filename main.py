@@ -2,7 +2,7 @@ import os
 import socket
 import docker
 import re
-from flask import Flask, session, redirect, url_for, has_request_context
+from flask import Flask, session, redirect, url_for, has_request_context, Response
 from authlib.integrations.flask_client import OAuth
 from dash import Dash, html, dcc, Input, Output, State, no_update
 import dash_bootstrap_components as dbc
@@ -16,6 +16,7 @@ DOCKER_IMAGE = "open-app-builder"
 SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "super_secret_dev_key")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+NETWORK_NAME = os.environ.get("DOCKER_NETWORK_NAME", "app-net")
 
 with open("repo_config.json", 'r') as json_file:
     REPOS =json.load(json_file)
@@ -41,12 +42,6 @@ conv = Ansi2HTMLConverter()#bg="#0d1117", fg="#c9d1d9", inline=True)
 app = Dash(__name__, server=server, external_stylesheets=[dbc.themes.BOOTSTRAP])
 
 # --- HELPER FUNCTIONS ---
-def get_free_port():
-    for port in PORT_RANGE:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            if s.connect_ex(('localhost', port)) != 0:
-                return port
-    return None
 
 def sanitize_container_name(email):
     return re.sub(r'[^a-zA-Z0-9]', '-', email)
@@ -74,7 +69,6 @@ def auth():
         'email': user_info['email'],
         'name': user_info['name'],
         'picture': user_info['picture'],
-        'port': get_free_port()
     }
     return redirect('/')
 
@@ -188,9 +182,7 @@ def deploy_repo(repo_url):
     
     user = session['user']
     repo_key = next((v['key'] for k, v in REPOS.items() if v['url'] == repo_url), "")
-    
-    kill_user_resources(user['email'])
-    
+
     cmd = (
         # f"export DEPLOYMENT_PRIVATE_KEY=\"{repo_key}\" && "
         f"yarn workflow deployment import {repo_url} -y --private-key '{repo_key}' && "
@@ -198,23 +190,18 @@ def deploy_repo(repo_url):
     )
 
     try:
-        # try:
-        #     for container in docker_client.containers.list(all=True, filters={'name': sanitize_container_name(user['email'])}):
-        #         if container.name == sanitize_container_name(user['email']):
-        #             container.remove()
-        # except Exception as e:
-        #     print(e)
+        kill_user_resources(user['email'])
         docker_client.containers.run(
             DOCKER_IMAGE,
             entrypoint="/bin/sh",
             command=["-c", cmd],
             name=sanitize_container_name(user['email']),
-            ports={'4200/tcp': user['port']},
+            network=NETWORK_NAME,
             labels={"user_repo": repo_url},
             detach=True,
             remove=False,
         )
-        return f"Started on port {user['port']}."
+        return "Started container, see Live System Logs for status."
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -245,7 +232,14 @@ def update_viewport(active_tab, n):
     c_name = sanitize_container_name(user['email'])
     
     if active_tab == "tab-preview":
-        return html.Iframe(src=f"http://localhost:{user['port']}", style={"width": "100%", "height": "80vh", "border": "none"})
+        # Nginx will intercept '/preview/' and route it
+        # We add a random query param to bust iframe caching if the container restarts
+        import time
+        return html.Iframe(
+            # src=f"/preview/?t={int(time.time())}", 
+            src=f"/preview/", 
+            style={"width": "100%", "height": "80vh", "border": "none"}
+        )
     
     elif active_tab == "tab-logs":
         try:
@@ -306,7 +300,38 @@ def update_viewport(active_tab, n):
             
     return html.Div("Select tab")
 
+
+@server.route('/_auth_check')
+def auth_check():
+    if 'user' not in session: return Response("Unauthorized", status=401)
+
+    email = session['user']['email']
+    container_name = sanitize_container_name(email)
+    
+    # Check if running
+    try:
+        c = docker_client.containers.get(container_name)
+        if c.status != 'running': raise Exception
+    except:
+        return Response("Container not running", status=404)
+
+    resp = Response("OK", status=200)
+    
+    # Instead of a PORT, we return the CONTAINER NAME (Hostname)
+    # Nginx will resolve "gabe-idems-international" to an IP address
+    resp.headers['X-Target-Host'] = container_name
+    return resp
+
+
+def is_container_running(email):
+    try:
+        container = docker_client.containers.get(sanitize_container_name(email))
+        return container.status == 'running'
+    except:
+        return False
+
+
 if __name__ == '__main__':
     # SSL usually needed for Google OAuth, or set OAUTHLIB_INSECURE_TRANSPORT for dev
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1' 
-    app.run(debug=True, port=8050)
+    app.run(debug=True, port=8050, host='0.0.0.0')
