@@ -236,8 +236,7 @@ def update_viewport(active_tab, n):
         # We add a random query param to bust iframe caching if the container restarts
         import time
         return html.Iframe(
-            # src=f"/preview/?t={int(time.time())}", 
-            src=f"/preview/", 
+            src=f"/preview/?t={int(time.time())}", 
             style={"width": "100%", "height": "80vh", "border": "none"}
         )
     
