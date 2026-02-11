@@ -4,7 +4,7 @@ import docker
 import re
 from flask import Flask, session, redirect, url_for, has_request_context, Response
 from authlib.integrations.flask_client import OAuth
-from dash import Dash, html, dcc, Input, Output, State, no_update
+from dash import Dash, html, dcc, Input, Output, State, no_update, callback_context
 import dash_bootstrap_components as dbc
 import json
 from ansi2html import Ansi2HTMLConverter
@@ -39,7 +39,16 @@ google = oauth.register(
 conv = Ansi2HTMLConverter()#bg="#0d1117", fg="#c9d1d9", inline=True)
 
 # NOTE: Removed suppress_callback_exceptions=True
-app = Dash(__name__, server=server, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app = Dash(
+    __name__,
+    server=server,
+    assets_folder='site_assets', 
+    assets_url_path='site_assets',
+    external_stylesheets=[
+        dbc.themes.BOOTSTRAP,
+        "https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css"
+    ]
+)
 
 # --- HELPER FUNCTIONS ---
 
@@ -83,7 +92,7 @@ def logout():
 
 def get_login_layout():
     return dbc.Container([
-        dbc.Row(dbc.Col(html.H1("App Builder Login"), className="text-center mt-5")),
+        dbc.Row(dbc.Col(html.H1("Open App Builder TestHub Login"), className="text-center mt-5")),
         dbc.Row(dbc.Col(
             # FIX 1: external_link=True forces a real HTTP request to Flask
             dbc.Button("Login with Google", href="/login", external_link=True, color="primary"), 
@@ -92,58 +101,89 @@ def get_login_layout():
     ])
 
 def get_dashboard_layout(user):
-    # If user is None (startup check), provide dummy data to avoid errors
     name = user['name'] if user else ""
-    picture = user['picture'] if user else ""
+    # Use a generic avatar if google picture fails, or keep user['picture']
+    picture = user['picture'] if user else "https://via.placeholder.com/40"
+    
+    # Current Repo Logic (Existing)
     current_repo = None
-
     if user and docker_client:
         try:
-            container_name = sanitize_container_name(user['email'])
-            container = docker_client.containers.get(container_name)
-            
-            # Read the label we saved earlier
-            current_repo = container.labels.get("user_repo")
-            
+            c = docker_client.containers.get(sanitize_container_name(user['email']))
+            current_repo = c.labels.get("user_repo")
         except docker.errors.NotFound:
             pass # No container running, keep selection empty
         except Exception as e:
             print(f"Error checking container state: {e}")
-    
-    return dbc.Container([
-        dbc.Row([
-            dbc.Col(html.H4(f"Welcome, {name}")),
-            dbc.Col(html.Img(src=picture, height="40px", style={'borderRadius': '50%'})),
-            dbc.Col(dbc.Button("Logout", href="/logout", external_link=True, color="danger", size="sm"), width="auto")
-        ], className="py-3 border-bottom"),
 
+    # --- NAVBAR ---
+    navbar = dbc.Navbar(
+        dbc.Container([
+            # Left: IDEMS Logo
+            html.A(
+                dbc.Row([
+                    dbc.Col(html.Img(src="/site_assets/idems-logo.png", height="40px")),
+                    dbc.Col(dbc.NavbarBrand("Open App Builder TestHub", className="ms-3 fs-4 fw-bold text-white")),
+                ], align="center", className="g-0"),
+                href="/",
+                style={"textDecoration": "none"},
+            ),
+            
+            # Right: User Info & Logout
+            dbc.Row([
+                dbc.Col(html.Span(f"Welcome, {name}", className="text-white me-3 d-none d-md-block")),
+                dbc.Col(html.Img(src=picture, height="35px", className="rounded-circle border border-secondary")),
+                dbc.Col(dbc.Button("Logout", href="/logout", external_link=True, color="danger", size="sm", className="ms-3")),
+            ], align="center", className="g-0"),
+        ], fluid=True),
+        color="#1e1e1e", # Matches custom CSS var
+        dark=True,
+        className="border-bottom py-2"
+    )
+
+    return html.Div([
+            navbar,
+            
+            dbc.Container([
         dbc.Row([
             dbc.Col([
-                html.H5("Controls", className="mt-3"),
-                html.Label("Select Repo:"),
-                dcc.Dropdown(
-                    id='repo-selector',
-                    options=[{'label': k, 'value': v['url']} for k, v in REPOS.items()],
-                    placeholder="Select repo...",
-                    value=current_repo,
-                ),
-                html.Div(id='deploy-status', className="mt-2 mb-4 text-muted small"),
-                html.Hr(),
-                dbc.Button("Sync Workflow", id='btn-sync', color="info", className="w-100 mb-2"),
-                html.Div(id='sync-status', className="text-muted small")
-            ], width=3, className="bg-light border-end vh-100"),
+                html.Div([
+
+                    html.H5("Controls", className="mt-3"),
+                    html.Label("Select Repo:"),
+                    dcc.Dropdown(
+                        id='repo-selector',
+                        options=[{'label': k, 'value': v['url']} for k, v in REPOS.items()],
+                        placeholder="Select repo...",
+                        value=current_repo,
+                        
+                    ),
+                    html.Div(id='deploy-status', className="mb-4 text-muted small"),
+                    html.Hr(className="border-secondary"),
+                    dbc.Button([
+                        html.I(className="bi bi-arrow-repeat me-2"), 
+                        "Sync Workflow"
+                    ], id='btn-sync', color="primary", className="w-100 mb-2 shadow-sm"),
+                    html.Div(id='sync-status', className="text-muted small text-center")
+                ], className="p-4 h-100") # Padding for the panel
+                
+            ], width=3, className="bg-dark-panel vh-100 p-0"), # Remove default Col padding
 
             dbc.Col([
                 dbc.Tabs([
-                    dbc.Tab(label="App Preview", tab_id="tab-preview"),
-                    dbc.Tab(label="Live System Logs", tab_id="tab-logs"),
-                ], id="viewport-tabs", active_tab="tab-preview", className="mt-3"),
-                html.Div(id="tab-content", className="p-3 border border-top-0")
-            ], width=9)
-        ]),
-        # Disable interval by default, enable via callback or if logged in
+                    dbc.Tab(label="App Preview", tab_id="tab-preview", label_class_name="fs-5"),
+                    dbc.Tab(label="Live System Logs", tab_id="tab-logs", label_class_name="fs-5"),
+                ], id="viewport-tabs", active_tab="tab-preview", className="mt-3 border-0"),
+                
+                html.Div(
+                    id="tab-content", 
+                    className="bg-dark border border-secondary rounded p-1 mt-2", 
+                    style={"minHeight": "80vh"}
+                )
+            ], width=9, className="main-content ps-4")
+        ], className="g-0"), # Remove gutter spacing for full-width split
         dcc.Interval(id='log-poller', interval=2000, n_intervals=0, disabled=False) 
-    ], fluid=True)
+    ], fluid=True, className="p-0")])
 
 # --- MAIN LAYOUT FUNCTION ---
 
@@ -227,6 +267,12 @@ def sync_workflow(n):
 def update_viewport(active_tab, n):
     # Guard: Stop updates if not logged in
     if 'user' not in session: return no_update
+
+    # This prevents the iframe from reloading/flashing.
+    ctx = callback_context
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    if trigger_id == 'log-poller' and active_tab == 'tab-preview':
+        return no_update
 
     user = session['user']
     c_name = sanitize_container_name(user['email'])

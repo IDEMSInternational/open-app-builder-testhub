@@ -1,0 +1,112 @@
+/* assets/custom.css */
+
+:root {
+    /* IDEMS Palette approximation */
+    --idems-dark: #1e1e1e;       /* Main Background */
+    --idems-panel: #252526;      /* Sidebar/Card Background */
+    --idems-orange: #f28b20;     /* Primary Accent */
+    --idems-text: #e0e0e0;       /* Main Text */
+    --idems-text-muted: #a0a0a0;
+    --border-color: #3e3e42;
+}
+
+body {
+    background-color: var(--idems-dark);
+    /* color: var(--idems-text); */
+    color: var(--idems-text-muted);
+    font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+/* --- Sidebar & Containers --- */
+.bg-dark-panel {
+    background-color: var(--idems-panel) !important;
+    border-right: 1px solid var(--border-color);
+}
+
+.main-content {
+    background-color: var(--idems-dark);
+}
+
+/* --- Typography --- */
+h1, h2, h3, h4, h5, h6 {
+    color: white;
+    font-weight: 600;
+}
+
+label {
+    color: var(--idems-text-muted);
+    font-weight: 500;
+    margin-bottom: 5px;
+}
+
+/* --- Buttons --- */
+.btn-primary {
+    background-color: var(--idems-orange);
+    border-color: var(--idems-orange);
+    color: black;
+    font-weight: bold;
+}
+.btn-primary:hover {
+    background-color: #d97b1a; /* Darker orange */
+    border-color: #d97b1a;
+    color: black;
+}
+
+.btn-danger {
+    background-color: #d32f2f;
+    border: none;
+}
+
+/* --- Tabs --- */
+.nav-tabs {
+    border-bottom: 1px solid var(--border-color);
+}
+.nav-tabs .nav-link {
+    color: var(--idems-text-muted);
+    border: none;
+    background: transparent;
+}
+.nav-tabs .nav-link.active {
+    color: var(--idems-orange);
+    background-color: transparent;
+    border-bottom: 3px solid var(--idems-orange);
+    font-weight: bold;
+}
+.nav-tabs .nav-link:hover {
+    border-color: transparent;
+    color: white;
+}
+
+/* --- Dash Dropdown Dark Mode Hack --- */
+/* Dash dropdowns are hard to style, this forces them dark */
+.Select-control {
+    background-color: var(--idems-dark) !important;
+    border-color: var(--border-color) !important;
+    color: white !important;
+}
+.Select-menu-outer {
+    background-color: var(--idems-panel) !important;
+    border-color: var(--border-color) !important;
+}
+.Select-value-label {
+    color: white !important;
+}
+.Select-placeholder {
+    color: var(--idems-text-muted) !important;
+}
+.Select-option {
+    background-color: var(--idems-panel) !important;
+    color: white !important;
+}
+.Select-option.is-focused {
+    background-color: var(--idems-orange) !important;
+    color: black !important;
+}
+
+/* --- Utilities --- */
+.border-bottom {
+    border-bottom: 1px solid var(--border-color) !important;
+}
+.text-muted {
+    color: var(--idems-text-muted) !important;
+}
