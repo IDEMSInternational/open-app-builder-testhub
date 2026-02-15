@@ -28,7 +28,8 @@ services:
       - "443:443"
     environment:
       - CERTBOT_EMAIL=${CERTBOT_EMAIL}
-      - DOMAIN=${DOMAIN} 
+      - DOMAIN=${DOMAIN}
+      - USE_LOCAL_CA=${USE_LOCAL_CA}
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - letsencrypt_data:/etc/letsencrypt
