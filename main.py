@@ -485,4 +485,4 @@ threading.Thread(target=monitor_user_activity, daemon=True).start()
 if __name__ == '__main__':
     # SSL usually needed for Google OAuth, or set OAUTHLIB_INSECURE_TRANSPORT for dev
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1' 
-    app.run(debug=True, port=8050, host='0.0.0.0')
+    app.run(debug=False, port=8050, host='0.0.0.0')
