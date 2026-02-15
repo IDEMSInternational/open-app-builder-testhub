@@ -8,15 +8,20 @@ from dash import Dash, html, dcc, Input, Output, State, no_update, callback_cont
 import dash_bootstrap_components as dbc
 import json
 from ansi2html import Ansi2HTMLConverter
+import time
+from datetime import datetime, UTC
+import threading
 
 # --- CONFIGURATION ---
-PORT_RANGE = range(5000, 5050)
-DOCKER_IMAGE = "open-app-builder"
+DOCKER_IMAGE = "ghcr.io/gabebolton/open-app-builder:latest"
 # Ideally load these from environment variables
 SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "super_secret_dev_key")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 NETWORK_NAME = os.environ.get("DOCKER_NETWORK_NAME", "app-net")
+
+HEARTBEAT_TIMEOUT = 10  # Seconds to wait before killing container (buffer for 2s poll)
+USER_HEARTBEATS = {}
 
 with open("repo_config.json", 'r') as json_file:
     REPOS =json.load(json_file)
@@ -55,12 +60,13 @@ app = Dash(
 def sanitize_container_name(email):
     return re.sub(r'[^a-zA-Z0-9]', '-', email)
 
-def kill_user_resources(email):
+def kill_user_resources(email, remove=True):
     if not docker_client: return
     try:
         container = docker_client.containers.get(sanitize_container_name(email))
         container.stop()
-        container.remove()
+        if remove:
+            container.remove()
     except:
         pass
 
@@ -111,6 +117,7 @@ def get_dashboard_layout(user):
         try:
             c = docker_client.containers.get(sanitize_container_name(user['email']))
             current_repo = c.labels.get("user_repo")
+            c.start()
         except docker.errors.NotFound:
             pass # No container running, keep selection empty
         except Exception as e:
@@ -164,6 +171,10 @@ def get_dashboard_layout(user):
                         html.I(className="bi bi-arrow-repeat me-2"), 
                         "Sync Workflow"
                     ], id='btn-sync', color="primary", className="w-100 mb-2 shadow-sm"),
+                    dbc.Button([
+                        html.I(className="bi bi-exclamation-triangle-fill me-2"), 
+                        "Force Rebuild"
+                    ], id='btn-rebuild', color="warning", className="w-100 mb-2 shadow-sm text-dark"),
                     html.Div(id='sync-status', className="text-muted small text-center")
                 ], className="p-4 h-100") # Padding for the panel
                 
@@ -219,13 +230,54 @@ app.layout = serve_layout
 def deploy_repo(repo_url):
     # Guard: If callback fires but no user is in session (shouldn't happen but good practice)
     if 'user' not in session: return no_update
+    if not repo_url: return no_update
     
     user = session['user']
+
+    # If user already has a container set up for this repo, start it
+    try:
+        c_name = sanitize_container_name(user['email'])
+        existing_c = docker_client.containers.get(c_name)
+        
+        # If the container exists and is for the same repo...
+        if existing_c.labels.get("user_repo") == repo_url:
+            # If it was stopped, wake it up.
+            if existing_c.status != 'running':
+                existing_c.start()
+                return "Resumed existing session."
+            
+            # If it's already running, do nothing.
+            return "Container is active."
+            
+    except docker.errors.NotFound:
+        pass # No container exists, proceed to full deploy
+    except Exception as e:
+        print(f"Status check error: {e}")
+
+    return launch_container(repo_url)
+
+@app.callback(
+    Output('deploy-status', 'children', allow_duplicate=True),
+    State('repo-selector', 'value'),
+    Input('btn-rebuild', 'n_clicks'),
+    prevent_initial_call=True
+)
+def force_rebuild(repo_url, n_clicks):
+    return launch_container(repo_url)
+
+def launch_container(repo_url):
+    """
+    Destroys any existing container for the user and starts a fresh one 
+    for the specified repo.
+    """
+    user = session['user']
+
     repo_key = next((v['key'] for k, v in REPOS.items() if v['url'] == repo_url), "")
 
     cmd = (
         # f"export DEPLOYMENT_PRIVATE_KEY=\"{repo_key}\" && "
-        f"yarn workflow deployment import {repo_url} -y --private-key '{repo_key}' && "
+        "[ -f './idems_app/deployments/activeDeployment.json' ] || "
+        f"yarn workflow deployment import {repo_url} -y ; "
         f"yarn start:docker"
     )
 
@@ -240,6 +292,7 @@ def deploy_repo(repo_url):
             labels={"user_repo": repo_url},
             detach=True,
             remove=False,
+            environment={"DEPLOYMENT_PRIVATE_KEY": repo_key}
         )
         return "Started container, see Live System Logs for status."
     except Exception as e:
@@ -268,6 +321,9 @@ def update_viewport(active_tab, n):
     # Guard: Stop updates if not logged in
     if 'user' not in session: return no_update
 
+    user = session['user']
+    USER_HEARTBEATS[user['email']] = time.time()
+
     # This prevents the iframe from reloading/flashing.
     ctx = callback_context
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
@@ -280,7 +336,6 @@ def update_viewport(active_tab, n):
     if active_tab == "tab-preview":
         # Nginx will intercept '/preview/' and route it
         # We add a random query param to bust iframe caching if the container restarts
-        import time
         return html.Iframe(
             src=f"/preview/?t={int(time.time())}", 
             style={"width": "100%", "height": "80vh", "border": "none"}
@@ -375,6 +430,57 @@ def is_container_running(email):
     except:
         return False
 
+
+def monitor_user_activity():
+    """Background loop to clean up containers for users who closed the tab."""
+    while True:
+        time.sleep(5)  # Check every 5 seconds
+        counter = 0
+        now = time.time()
+        
+        # Stop Unused Containers after HEARTBEAT_TIMEOUT seconds
+        for email, last_seen in list(USER_HEARTBEATS.items()):
+            if last_seen == None:
+                continue
+            if now - last_seen > HEARTBEAT_TIMEOUT:
+                print(f"Heartbeat lost for {email}. Stopping container...")
+                kill_user_resources(email, remove=False)
+                USER_HEARTBEATS[email] = None
+        
+        if counter > 3:
+            counter += 1
+            continue
+        
+        # Remove Unused Containers after 1 day
+        for email, last_seen in list(USER_HEARTBEATS.items()):
+            if last_seen is not None:
+                continue
+
+            try:
+                container = docker_client.containers.get(sanitize_container_name(email))
+                if container.status == "exited":
+                    finished_at_str = container.attrs['State']['FinishedAt']
+                    finished_at = datetime.fromisoformat(finished_at_str.replace('Z', '+00:00'))
+                    current_time = datetime.now(UTC)
+                    stopped_duration = current_time - finished_at
+                    
+                    if stopped_duration > 24*60*60:
+                        container.remove()
+                        # Remove email record
+                        USER_HEARTBEATS.pop(email, None)
+
+                elif container.status == "running":
+                    USER_HEARTBEATS.pop(email, None)
+                    
+                else:
+                    return f"Container '{sanitize_container_name(email)}' has an unexpected status: {container.status}"
+
+            except docker.errors.NotFound:
+                USER_HEARTBEATS.pop(email, None)
+            except Exception as e:
+                return f"An error occurred: {e}"
+
+threading.Thread(target=monitor_user_activity, daemon=True).start()
 
 if __name__ == '__main__':
     # SSL usually needed for Google OAuth, or set OAUTHLIB_INSECURE_TRANSPORT for dev
