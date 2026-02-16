@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 # --- CONFIGURATION ---
 load_dotenv()
-DOCKER_IMAGE = "open-app-builder" # "ghcr.io/gabebolton/open-app-builder:latest"
+DOCKER_IMAGE = "ghcr.io/gabebolton/open-app-builder:latest"
 # Ideally load these from environment variables
 SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "super_secret_dev_key")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
