@@ -4,3 +4,4 @@ authlib
 dash
 dash_bootstrap_components
 ansi2html
+python-dotenv
