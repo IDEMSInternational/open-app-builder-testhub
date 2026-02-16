@@ -296,7 +296,7 @@ def launch_container(repo_url):
     )
 
     try:
-        kill_user_resources(user['email'])
+        kill_user_resources(user['email'], remove=True)
         docker_client.containers.run(
             DOCKER_IMAGE,
             entrypoint="/bin/sh",
