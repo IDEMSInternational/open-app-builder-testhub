@@ -11,14 +11,17 @@ from ansi2html import Ansi2HTMLConverter
 import time
 from datetime import datetime, UTC
 import threading
+from dotenv import load_dotenv
 
 # --- CONFIGURATION ---
+load_dotenv()
 DOCKER_IMAGE = "ghcr.io/gabebolton/open-app-builder:latest"
 # Ideally load these from environment variables
 SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "super_secret_dev_key")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
 NETWORK_NAME = os.environ.get("DOCKER_NETWORK_NAME", "app-net")
+DOMAIN = os.environ.get("DOMAIN", None)
 
 HEARTBEAT_TIMEOUT = 10  # Seconds to wait before killing container (buffer for 2s poll)
 USER_HEARTBEATS = {}
@@ -73,6 +76,17 @@ def kill_user_resources(email, remove=True):
 # --- FLASK ROUTES ---
 @server.route('/login')
 def login():
+    if DOMAIN in ["localhost", "local"]:
+        if "user" not in session:
+            session["user"] = {
+                "sub": "localdev",
+                "email": "localhost@example.com",
+                "name": "Local Developer",
+                "picture": None,
+            }
+        print("Logging in as localhost")
+        return redirect('/')
+
     redirect_uri = url_for('auth', _external=True)
     return google.authorize_redirect(redirect_uri)
 
@@ -282,7 +296,7 @@ def launch_container(repo_url):
     )
 
     try:
-        kill_user_resources(user['email'])
+        kill_user_resources(user['email'], remove=True)
         docker_client.containers.run(
             DOCKER_IMAGE,
             entrypoint="/bin/sh",
@@ -292,7 +306,10 @@ def launch_container(repo_url):
             labels={"user_repo": repo_url},
             detach=True,
             remove=False,
-            environment={"DEPLOYMENT_PRIVATE_KEY": repo_key}
+            environment={
+                "DEPLOYMENT_PRIVATE_KEY": repo_key,
+                "NODE_OPTIONS": "--max-old-space-size=4608",
+            }
         )
         return "Started container, see Live System Logs for status."
     except Exception as e:
@@ -485,4 +502,4 @@ threading.Thread(target=monitor_user_activity, daemon=True).start()
 if __name__ == '__main__':
     # SSL usually needed for Google OAuth, or set OAUTHLIB_INSECURE_TRANSPORT for dev
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1' 
-    app.run(debug=True, port=8050, host='0.0.0.0')
+    app.run(debug=False, port=8050, host='0.0.0.0')
