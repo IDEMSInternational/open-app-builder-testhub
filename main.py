@@ -46,7 +46,6 @@ google = oauth.register(
 
 conv = Ansi2HTMLConverter()#bg="#0d1117", fg="#c9d1d9", inline=True)
 
-# NOTE: Removed suppress_callback_exceptions=True
 app = Dash(
     __name__,
     server=server,
@@ -57,6 +56,8 @@ app = Dash(
         "https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css"
     ]
 )
+app.title = "TestHub"
+app._favicon = ("idems-logo.png") 
 
 # --- HELPER FUNCTIONS ---
 

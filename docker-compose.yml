@@ -28,6 +28,7 @@ services:
       - CERTBOT_EMAIL=${CERTBOT_EMAIL}
       - DOMAIN=${DOMAIN}
       - USE_LOCAL_CA=${USE_LOCAL_CA}
+      - NGINX_ENVSUBST_OUTPUT_DIR=/etc/nginx/user_conf.d
     volumes:
       - ./nginx_conf/default.conf.template:/etc/nginx/templates/default.conf.template:ro
       - letsencrypt_data:/etc/letsencrypt
@@ -45,3 +46,4 @@ networks:
 
 volumes:
   letsencrypt_data:
+    driver: local
