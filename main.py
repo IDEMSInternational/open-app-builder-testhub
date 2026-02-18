@@ -57,7 +57,7 @@ app = Dash(
     ]
 )
 app.title = "TestHub"
-app._favicon = ("idems-logo.png") 
+app._favicon = ("cropped-IDEMS_logomark_with_border_circle-32x32.png") 
 
 # --- HELPER FUNCTIONS ---
 
