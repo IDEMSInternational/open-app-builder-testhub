@@ -12,10 +12,11 @@ import time
 from datetime import datetime, UTC
 import threading
 from dotenv import load_dotenv
+import shlex
 
 # --- CONFIGURATION ---
 load_dotenv()
-DOCKER_IMAGE = "ghcr.io/gabebolton/open-app-builder:latest"
+DOCKER_IMAGE = "ghcr.io/idemsinternational/open-app-builder:latest"
 # Ideally load these from environment variables
 SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "super_secret_dev_key")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
@@ -41,7 +42,7 @@ google = oauth.register(
     client_id=GOOGLE_CLIENT_ID,
     client_secret=GOOGLE_CLIENT_SECRET,
     server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
-    client_kwargs={'scope': 'openid email profile'}
+    client_kwargs={'scope': 'openid email profile https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.metadata.readonly'},
 )
 
 conv = Ansi2HTMLConverter()#bg="#0d1117", fg="#c9d1d9", inline=True)
@@ -54,7 +55,8 @@ app = Dash(
     external_stylesheets=[
         dbc.themes.BOOTSTRAP,
         "https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css"
-    ]
+    ],
+    update_title=None,
 )
 app.title = "TestHub"
 app._favicon = ("cropped-IDEMS_logomark_with_border_circle-32x32.png") 
@@ -85,11 +87,12 @@ def login():
                 "name": "Local Developer",
                 "picture": None,
             }
+            session['oauth_token'] = os.environ.get("LOCAL_OAUTH_CRED", None)
         print("Logging in as localhost")
         return redirect('/')
 
     redirect_uri = url_for('auth', _external=True)
-    return google.authorize_redirect(redirect_uri)
+    return google.authorize_redirect(redirect_uri, access_type='offline', prompt='consent')
 
 @server.route('/auth/callback')
 def auth():
@@ -100,6 +103,7 @@ def auth():
         'name': user_info['name'],
         'picture': user_info['picture'],
     }
+    session['oauth_token'] = token
     return redirect('/')
 
 @server.route('/logout')
@@ -259,6 +263,7 @@ def deploy_repo(repo_url):
             # If it was stopped, wake it up.
             if existing_c.status != 'running':
                 existing_c.start()
+                threading.Thread(target=setup_container, args=(user['email'], repo_url)).start()
                 return "Resumed existing session."
             
             # If it's already running, do nothing.
@@ -282,26 +287,17 @@ def force_rebuild(repo_url, n_clicks):
 
 def launch_container(repo_url):
     """
-    Destroys any existing container for the user and starts a fresh one 
-    for the specified repo.
+    Destroys any existing container for the user and starts a fresh one.
     """
     user = session['user']
-
     repo_key = next((v['key'] for k, v in REPOS.items() if v['url'] == repo_url), "")
-
-    cmd = (
-        # f"export DEPLOYMENT_PRIVATE_KEY=\"{repo_key}\" && "
-        "[ -f './idems_app/deployments/activeDeployment.json' ] || "
-        f"yarn workflow deployment import {repo_url} -y ; "
-        f"yarn start:docker"
-    )
 
     try:
         kill_user_resources(user['email'], remove=True)
         docker_client.containers.run(
             DOCKER_IMAGE,
             entrypoint="/bin/sh",
-            command=["-c", cmd],
+            command=["-c", "sleep infinity"],
             name=sanitize_container_name(user['email']),
             network=NETWORK_NAME,
             labels={"user_repo": repo_url},
@@ -312,9 +308,47 @@ def launch_container(repo_url):
                 "NODE_OPTIONS": "--max-old-space-size=4608",
             }
         )
-        return "Started container, see Live System Logs for status."
+
+        threading.Thread(target=setup_container, args=(user['email'], repo_url)).start()
+
+        return "Container created. Provisioning environment... see Live System Logs for status"
     except Exception as e:
         return f"Error: {str(e)}"
+
+
+def setup_container(email, repo_url):
+    """Background task to orchestrate the Node environment via PM2."""
+    try:
+        c = docker_client.containers.get(sanitize_container_name(email))
+        
+        c.exec_run(["/bin/sh", "-c", "echo '--- Initializing Environment ---' > /proc/1/fd/1"])
+
+        # 1. Check if the deployment is already imported
+        # (This is much safer in Python than inside a Docker CMD string)
+        check = c.exec_run(["/bin/sh", "-c", "[ -d './idems_app/deployments' ]"])
+        
+        if check.exit_code != 0:
+            c.exec_run(["/bin/sh", "-c", f"echo '--- Importing Repository: {repo_url} ---' > /proc/1/fd/1"])
+            
+            # Run import and stream output to Docker logs
+            c.exec_run(["/bin/sh", "-c", f"yarn workflow deployment import {repo_url} -y > /proc/1/fd/1 2>&1"])
+
+        c.exec_run(["/bin/sh", "-c", "echo '--- Starting Preview Server (PM2) ---' > /proc/1/fd/1"])
+        
+        # 2. Start PM2.
+        # We use --out and --error to pipe PM2's background logs directly to Docker's PID 1 stream!
+        start_cmd = (
+            "npx pm2 start yarn "
+            "--name 'preview_app' "
+            "--output /proc/1/fd/1 "
+            "--error /proc/1/fd/1 "
+            "-- start:docker > /proc/1/fd/1 2>&1"
+        )
+        c.exec_run(["/bin/sh", "-c", start_cmd])
+
+    except Exception as e:
+        print(f"Setup thread error for {email}: {e}")
+
 
 @app.callback(
     Output('sync-status', 'children'),
@@ -323,12 +357,79 @@ def launch_container(repo_url):
 )
 def sync_workflow(n):
     if 'user' not in session: return no_update
+
+    user_email = session['user']['email']
+    token_data = session.get('oauth_token', {})
+
+    # 1. Construct the Application Credentials (credentials.json)
+    client_config = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "project_id": "open-app-builder",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uris": ["http://localhost"] 
+    }
+
+    creds_data = {
+        "web": client_config,
+        "installed": client_config
+    }
+
+    # 2. Adjust token timestamp formatting (Google Node scripts often expect ms)
+    if 'expires_at' in token_data:
+        token_data['expiry_date'] = token_data['expires_at'] * 1000
+
+    creds_json = json.dumps(creds_data)
+    token_json = json.dumps(token_data)
+
     try:
-        c = docker_client.containers.get(sanitize_container_name(session['user']['email']))
-        c.exec_run("yarn workflow sync", detach=True)
-        return "Sync sent."
+        c = docker_client.containers.get(sanitize_container_name(user_email))
+
+        # 3. Use shlex.quote to safely escape the JSON strings for the bash shell
+        safe_creds = shlex.quote(creds_json)
+        safe_token = shlex.quote(token_json)
+
+        # 4. Construct the unified command.
+        # - Creates the config directory
+        # - Writes both credentials.json and token.json
+        # - Redirects standard output and standard error (2>&1) directly to Docker's PID 1 stream
+        cmd = f"""
+        mkdir -p /app/packages/scripts/config && \
+        echo {safe_creds} > /app/packages/scripts/config/credentials.json && \
+        echo {safe_token} > /app/packages/scripts/config/token.json && \
+        echo "--- Starting Yarn Workflow Sync ---" > /proc/1/fd/1 && \
+        yarn workflow sync > /proc/1/fd/1 2>&1 && \
+        echo "--- Stopping PM2 Wrapper ---" > /proc/1/fd/1 && \
+        npx pm2 stop preview_app > /proc/1/fd/1 2>&1 && \
+        echo "--- Clearing Orphaned Port 4200 ---" > /proc/1/fd/1 && \
+        fuser -k 4200/tcp > /proc/1/fd/1 2>&1 || true && \
+        echo "--- Restarting Preview Server ---" > /proc/1/fd/1 && \
+        npx pm2 start preview_app > /proc/1/fd/1 2>&1
+        """
+
+        # 5. Execute synchronously (detach=False is the default). 
+        # This blocks the UI slightly but guarantees we get the actual exit code.
+        exec_log = c.exec_run(["/bin/sh", "-c", cmd])
+
+        # 6. Return improved contextual feedback based on the exact exit code
+        if exec_log.exit_code == 0:
+            return html.Span(
+                [html.I(className="bi bi-check-circle-fill me-1"), "Sync completed successfully. See logs."], 
+                className="text-success fw-bold"
+            )
+        else:
+            return html.Span(
+                [html.I(className="bi bi-exclamation-triangle-fill me-1"), f"Sync failed (Exit code: {exec_log.exit_code}). Check logs tab."], 
+                className="text-danger fw-bold"
+            )
+
     except Exception as e:
-        return f"Failed: {e}"
+        return html.Span(
+            [html.I(className="bi bi-x-circle-fill me-1"), f"System Error: {str(e)}"], 
+            className="text-danger fw-bold"
+        )
 
 @app.callback(
     Output('tab-content', 'children'),
