@@ -7,6 +7,7 @@ services:
     volumes:
       # CRITICAL: Give the app access to the Host's Docker Daemon
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./access_control.json:/app/access_control.json
     environment:
       - FLASK_SECRET_KEY=${FLASK_SECRET_KEY}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
