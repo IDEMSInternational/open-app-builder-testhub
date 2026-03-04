@@ -26,6 +26,7 @@ DOMAIN = os.environ.get("DOMAIN", None)
 
 HEARTBEAT_TIMEOUT = 10  # Seconds to wait before killing container (buffer for 2s poll)
 USER_HEARTBEATS = {}
+CONTAINER_STAGES = {}  # Stores current yarn/pm2 stage
 
 with open("repo_config.json", 'r') as json_file:
     REPOS =json.load(json_file)
@@ -282,35 +283,6 @@ def get_admin_layout(user, pathname="/"):
     if not is_admin(email):
         return html.Div([get_navbar(user, pathname), dbc.Container(html.H3("Unauthorized", className="text-danger mt-5"))])
 
-    # Fetch container info
-    containers = []
-    try:
-        # Filter by network to only see testhub-related containers
-        for c in docker_client.containers.list(all=True, filters={"network": NETWORK_NAME}):
-            # Skip the infrastructure containers
-            if c.name in ['control-plane', 'gateway']: continue
-            
-            repo = c.labels.get("user_repo", "None")
-            status_color = "success" if c.status == "running" else "secondary"
-            
-            containers.append(html.Tr([
-                html.Td(c.name), 
-                html.Td(repo),
-                html.Td(dbc.Badge(c.status, color=status_color, className="me-1")),
-                html.Td([
-                    # Using Dash Pattern Matching IDs so we can have dynamic buttons
-                    dbc.Button("Kill & Rm", id={'type': 'kill-btn', 'index': c.name}, color="danger", size="sm"),
-                    html.Span(id={'type': 'kill-status', 'index': c.name}, className="ms-2 small text-danger")
-                ])
-            ]))
-    except Exception as e:
-        print(f"Error fetching containers: {e}")
-
-    container_table = dbc.Table([
-        html.Thead(html.Tr([html.Th("Container (User)"), html.Th("Current Repo"), html.Th("Status"), html.Th("Actions")])),
-        html.Tbody(containers)
-    ], bordered=True, hover=True, striped=True, className="mt-2")
-
     current_acl = json.dumps(load_acl(), indent=4)
 
     return html.Div([
@@ -331,8 +303,10 @@ def get_admin_layout(user, pathname="/"):
                 
                 dbc.Col([
                     html.H4("Active Environment Resources", className="mt-4 text-white"),
-                    html.P("Monitor and manage user containers. Refresh page to update statuses.", className="text-muted small mb-1"),
-                    container_table,
+                    html.P("Live view of user containers, resources, and background processes.", className="text-muted small mb-1"),
+                    # The table target and the polling interval
+                    html.Div(id="admin-table-container", className="mt-2"),
+                    dcc.Interval(id='admin-poller', interval=2000, n_intervals=0) 
                 ], width=8)
             ])
         ], fluid=True, className="px-5")
@@ -411,6 +385,7 @@ def launch_container(repo_url):
 
     try:
         kill_user_resources(user['email'], remove=True)
+        CONTAINER_STAGES[user['email']] = "Container Created (Waiting)"
         docker_client.containers.run(
             DOCKER_IMAGE,
             entrypoint="/bin/sh",
@@ -445,11 +420,13 @@ def setup_container(email, repo_url):
         check = c.exec_run(["/bin/sh", "-c", "[ -d './idems_app/deployments' ]"])
         
         if check.exit_code != 0:
+            CONTAINER_STAGES[email] = "Importing Repository..."
             c.exec_run(["/bin/sh", "-c", f"echo '--- Importing Repository: {repo_url} ---' > /proc/1/fd/1"])
             
             # Run import and stream output to Docker logs
             c.exec_run(["/bin/sh", "-c", f"yarn workflow deployment import {repo_url} -y > /proc/1/fd/1 2>&1"])
 
+        CONTAINER_STAGES[email] = "Starting Preview Server..."
         c.exec_run(["/bin/sh", "-c", "echo '--- Starting Preview Server (PM2) ---' > /proc/1/fd/1"])
         
         # 2. Start PM2.
@@ -462,6 +439,7 @@ def setup_container(email, repo_url):
             "-- start:docker > /proc/1/fd/1 2>&1"
         )
         c.exec_run(["/bin/sh", "-c", start_cmd])
+        CONTAINER_STAGES[email] = "App Running"
 
     except Exception as e:
         print(f"Setup thread error for {email}: {e}")
@@ -528,15 +506,18 @@ def sync_workflow(n):
 
         # 5. Execute synchronously (detach=False is the default). 
         # This blocks the UI slightly but guarantees we get the actual exit code.
+        CONTAINER_STAGES[user_email] = "Syncing Workflow..."
         exec_log = c.exec_run(["/bin/sh", "-c", cmd])
 
         # 6. Return improved contextual feedback based on the exact exit code
         if exec_log.exit_code == 0:
+            CONTAINER_STAGES[user_email] = "App Running (Synced)"
             return html.Span(
                 [html.I(className="bi bi-check-circle-fill me-1"), "Sync completed successfully. See logs."], 
                 className="text-success fw-bold"
             )
         else:
+            CONTAINER_STAGES[user_email] = "Sync Failed"
             return html.Span(
                 [html.I(className="bi bi-exclamation-triangle-fill me-1"), f"Sync failed (Exit code: {exec_log.exit_code}). Check logs tab."], 
                 className="text-danger fw-bold"
@@ -671,6 +652,74 @@ def admin_kill_container(n, btn_id):
         return "Terminated"
     except Exception as e:
         return "Failed"
+
+@app.callback(
+    Output('admin-table-container', 'children'),
+    Input('admin-poller', 'n_intervals')
+)
+def update_admin_table(n):
+    if not has_request_context() or 'user' not in session or not is_admin(session['user']['email']):
+        return no_update
+
+    rows = []
+    now = time.time()
+
+    try:
+        # Fast query, no stats=True
+        for c in docker_client.containers.list(all=True, filters={"network": NETWORK_NAME}):
+            if c.name in ['control-plane', 'gateway']: continue
+            
+            repo = c.labels.get("user_repo", "None")
+            status_badge = dbc.Badge(c.status, color="success" if c.status == "running" else "secondary")
+            
+            # Reverse-engineer the email from the container name to look up our local state
+            email_match = next((email for email in USER_HEARTBEATS.keys() if sanitize_container_name(email) == c.name), c.name)
+            
+            # 1. Calculate Heartbeat Health
+            last_seen = USER_HEARTBEATS.get(email_match)
+            if last_seen is None:
+                hb_text = "Idle / Offline"
+                hb_color = "text-muted"
+            else:
+                seconds_ago = int(now - last_seen)
+                hb_text = f"{seconds_ago}s ago"
+                
+                # Color code the heartbeat warning
+                if seconds_ago > HEARTBEAT_TIMEOUT:
+                    hb_color = "text-danger" # About to be killed
+                elif seconds_ago > (HEARTBEAT_TIMEOUT / 2):
+                    hb_color = "text-warning"
+                else:
+                    hb_color = "text-success"
+
+            # 2. Get Current Stage
+            stage = CONTAINER_STAGES.get(email_match, "Unknown")
+            if c.status != "running":
+                stage = "Stopped"
+
+            rows.append(html.Tr([
+                html.Td([html.Strong(c.name), html.Br(), html.Small(repo, className="text-muted")]), 
+                html.Td(status_badge),
+                html.Td(html.Span(stage, className="small text-info")),
+                html.Td(html.Span(hb_text, className=f"small fw-bold {hb_color}")),
+                html.Td([
+                    dbc.Button("Kill", id={'type': 'kill-btn', 'index': c.name}, color="danger", size="sm", className="py-0"),
+                    html.Div(id={'type': 'kill-status', 'index': c.name}, className="small text-danger mt-1")
+                ])
+            ]))
+    except Exception as e:
+        return html.Div(f"Error loading containers: {e}", className="text-danger")
+
+    return dbc.Table([
+        html.Thead(html.Tr([
+            html.Th("Container / Repo"), 
+            html.Th("Status"),
+            html.Th("Current Stage"), 
+            html.Th("Last Heartbeat"), 
+            html.Th("Actions")
+        ])),
+        html.Tbody(rows)
+    ], bordered=True, hover=True, striped=True, className="mt-2")
 
 @app.callback(
     Output('page-content', 'children'),
