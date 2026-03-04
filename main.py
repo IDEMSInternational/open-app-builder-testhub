@@ -2,9 +2,9 @@ import os
 import socket
 import docker
 import re
-from flask import Flask, session, redirect, url_for, has_request_context, Response
+from flask import Flask, session, redirect, url_for, has_request_context, Response, request
 from authlib.integrations.flask_client import OAuth
-from dash import Dash, html, dcc, Input, Output, State, no_update, callback_context
+from dash import Dash, html, dcc, Input, Output, State, no_update, callback_context, MATCH
 import dash_bootstrap_components as dbc
 import json
 from ansi2html import Ansi2HTMLConverter
@@ -29,6 +29,49 @@ USER_HEARTBEATS = {}
 
 with open("repo_config.json", 'r') as json_file:
     REPOS =json.load(json_file)
+
+# --- ACCESS CONTROL SETUP ---
+ACL_FILE = "access_control.json"
+
+def load_acl():
+    """Loads the ACL file, creating a default one if it doesn't exist."""
+    if not os.path.exists(ACL_FILE):
+        default_acl = {"admin": []}
+        with open(ACL_FILE, 'w') as f:
+            json.dump(default_acl, f, indent=4)
+        return default_acl
+    with open(ACL_FILE, 'r') as f:
+        return json.load(f)
+
+def save_acl(acl_data):
+    """Saves the ACL data back to the file (for future Admin UI)."""
+    with open(ACL_FILE, 'w') as f:
+        json.dump(acl_data, f, indent=4)
+
+def is_admin(email):
+    """Checks if a user has the admin role."""
+    # Automatically grant admin to the local development mock user
+    if email == "localhost@example.com": 
+        return True
+    
+    acl = load_acl() # Load fresh to catch any manual file edits
+    return email in acl.get("admin", [])
+
+def get_allowed_repos(email):
+    """Returns a filtered dictionary of REPOS the user is allowed to access."""
+    if is_admin(email):
+        return REPOS
+
+    acl = load_acl()
+    allowed_repos = {}
+    
+    for repo_name, repo_data in REPOS.items():
+        # Look for a key like "access:My Repo Name"
+        acl_key = f"access:{repo_name}"
+        if email in acl.get(acl_key, []):
+            allowed_repos[repo_name] = repo_data
+            
+    return allowed_repos
 
 # --- SETUP ---
 server = Flask(__name__)
@@ -57,6 +100,7 @@ app = Dash(
         "https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css"
     ],
     update_title=None,
+    suppress_callback_exceptions=True,
 )
 app.title = "TestHub"
 app._favicon = ("cropped-IDEMS_logomark_with_border_circle-32x32.png") 
@@ -125,27 +169,22 @@ def get_login_layout():
         ))
     ])
 
-def get_dashboard_layout(user):
+def get_navbar(user, pathname="/"):
     name = user['name'] if user else ""
-    # Use a generic avatar if google picture fails, or keep user['picture']
     picture = user['picture'] if user else "https://via.placeholder.com/40"
-    
-    # Current Repo Logic (Existing)
-    current_repo = None
-    if user and docker_client:
-        try:
-            c = docker_client.containers.get(sanitize_container_name(user['email']))
-            current_repo = c.labels.get("user_repo")
-            c.start()
-        except docker.errors.NotFound:
-            pass # No container running, keep selection empty
-        except Exception as e:
-            print(f"Error checking container state: {e}")
+    email = user['email'] if user else ""
 
-    # --- NAVBAR ---
-    navbar = dbc.Navbar(
+    is_on_admin_page = (pathname == '/admin')
+    
+    if is_on_admin_page:
+        nav_btn = dbc.Button("Back to App", href="/", external_link=True, color="secondary", size="sm", className="ms-3")
+    elif is_admin(email):
+        nav_btn = dbc.Button("Admin Panel", href="/admin", external_link=True, color="info", size="sm", className="ms-3")
+    else:
+        nav_btn = None
+
+    return dbc.Navbar(
         dbc.Container([
-            # Left: IDEMS Logo
             html.A(
                 dbc.Row([
                     dbc.Col(html.Img(src="/site_assets/idems-logo.png", height="40px")),
@@ -154,18 +193,41 @@ def get_dashboard_layout(user):
                 href="/",
                 style={"textDecoration": "none"},
             ),
-            
-            # Right: User Info & Logout
             dbc.Row([
                 dbc.Col(html.Span(f"Welcome, {name}", className="text-white me-3 d-none d-md-block")),
                 dbc.Col(html.Img(src=picture, height="35px", className="rounded-circle border border-secondary")),
+                dbc.Col(nav_btn),
                 dbc.Col(dbc.Button("Logout", href="/logout", external_link=True, color="danger", size="sm", className="ms-3")),
             ], align="center", className="g-0"),
         ], fluid=True),
-        color="#1e1e1e", # Matches custom CSS var
+        color="#1e1e1e",
         dark=True,
         className="border-bottom py-2"
     )
+
+def get_dashboard_layout(user, pathname="/"):
+    name = user['name'] if user else ""
+    # Use a generic avatar if google picture fails, or keep user['picture']
+    picture = user['picture'] if user else "https://via.placeholder.com/40"
+
+    allowed_repos = get_allowed_repos(user.get('email', ''))
+    
+    # Current Repo Logic (Existing)
+    current_repo = None
+    if user and docker_client:
+        try:
+            c = docker_client.containers.get(sanitize_container_name(user['email']))
+            current_repo = c.labels.get("user_repo")
+
+            if current_repo not in [v['url'] for v in allowed_repos.values()]:
+                current_repo = None
+            c.start()
+        except docker.errors.NotFound:
+            pass # No container running, keep selection empty
+        except Exception as e:
+            print(f"Error checking container state: {e}")
+
+    navbar = get_navbar(user, pathname)
 
     return html.Div([
             navbar,
@@ -179,8 +241,8 @@ def get_dashboard_layout(user):
                     html.Label("Select Repo:"),
                     dcc.Dropdown(
                         id='repo-selector',
-                        options=[{'label': k, 'value': v['url']} for k, v in REPOS.items()],
-                        placeholder="Select repo...",
+                        options=[{'label': k, 'value': v['url']} for k, v in allowed_repos.items()],
+                        placeholder="Select repo..." if allowed_repos else "No repos assigned, contact Admin for access.",
                         value=current_repo,
                         
                     ),
@@ -215,26 +277,81 @@ def get_dashboard_layout(user):
         dcc.Interval(id='log-poller', interval=2000, n_intervals=0, disabled=False) 
     ], fluid=True, className="p-0")])
 
+def get_admin_layout(user, pathname="/"):
+    email = user['email'] if user else ""
+    if not is_admin(email):
+        return html.Div([get_navbar(user, pathname), dbc.Container(html.H3("Unauthorized", className="text-danger mt-5"))])
+
+    # Fetch container info
+    containers = []
+    try:
+        # Filter by network to only see testhub-related containers
+        for c in docker_client.containers.list(all=True, filters={"network": NETWORK_NAME}):
+            # Skip the infrastructure containers
+            if c.name in ['control-plane', 'gateway']: continue
+            
+            repo = c.labels.get("user_repo", "None")
+            status_color = "success" if c.status == "running" else "secondary"
+            
+            containers.append(html.Tr([
+                html.Td(c.name), 
+                html.Td(repo),
+                html.Td(dbc.Badge(c.status, color=status_color, className="me-1")),
+                html.Td([
+                    # Using Dash Pattern Matching IDs so we can have dynamic buttons
+                    dbc.Button("Kill & Rm", id={'type': 'kill-btn', 'index': c.name}, color="danger", size="sm"),
+                    html.Span(id={'type': 'kill-status', 'index': c.name}, className="ms-2 small text-danger")
+                ])
+            ]))
+    except Exception as e:
+        print(f"Error fetching containers: {e}")
+
+    container_table = dbc.Table([
+        html.Thead(html.Tr([html.Th("Container (User)"), html.Th("Current Repo"), html.Th("Status"), html.Th("Actions")])),
+        html.Tbody(containers)
+    ], bordered=True, hover=True, striped=True, className="mt-2")
+
+    current_acl = json.dumps(load_acl(), indent=4)
+
+    return html.Div([
+        get_navbar(user, pathname),
+        dbc.Container([
+            dbc.Row([
+                dbc.Col([
+                    html.H4("Access Control Editor", className="mt-4 text-white"),
+                    html.P("Edit raw JSON. Must remain valid JSON formatting.", className="text-muted small mb-1"),
+                    dcc.Textarea(
+                        id='acl-editor',
+                        value=current_acl,
+                        style={'width': '100%', 'height': '400px', 'fontFamily': 'monospace', 'backgroundColor': '#1e1e1e', 'color': '#c9d1d9', 'border': '1px solid #3e3e42'}
+                    ),
+                    dbc.Button("Save Configuration", id='save-acl-btn', color="success", className="mt-2 w-100"),
+                    html.Div(id='acl-save-status', className="mt-2 text-center fw-bold")
+                ], width=4),
+                
+                dbc.Col([
+                    html.H4("Active Environment Resources", className="mt-4 text-white"),
+                    html.P("Monitor and manage user containers. Refresh page to update statuses.", className="text-muted small mb-1"),
+                    container_table,
+                ], width=8)
+            ])
+        ], fluid=True, className="px-5")
+    ])
+
 # --- MAIN LAYOUT FUNCTION ---
 
 def serve_layout():
-    # Check if we are in a request (user loading page) or startup (Dash validating)
-    # Default to "Logged Out" state
     is_logged_in = False
-    user_data = None
-
     if has_request_context() and 'user' in session:
         is_logged_in = True
-        user_data = session['user']
 
-    # FIX 2: Render BOTH layouts, but hide one using CSS 'display'.
-    # This ensures all IDs (repo-selector, etc.) exist in the DOM at startup.
     login_style = {'display': 'none'} if is_logged_in else {'display': 'block'}
     dashboard_style = {'display': 'block'} if is_logged_in else {'display': 'none'}
 
     return html.Div([
+        dcc.Location(id='url', refresh=False), # Tracks the current URL
         html.Div(get_login_layout(), id='login-wrapper', style=login_style),
-        html.Div(get_dashboard_layout(user_data), id='dashboard-wrapper', style=dashboard_style)
+        html.Div(id='page-content', style=dashboard_style) # Target for our callback
     ])
 
 app.layout = serve_layout
@@ -519,6 +636,58 @@ def update_viewport(active_tab, n):
             
     return html.Div("Select tab")
 
+@app.callback(
+    Output('acl-save-status', 'children'),
+    Output('acl-save-status', 'className'),
+    Input('save-acl-btn', 'n_clicks'),
+    State('acl-editor', 'value'),
+    prevent_initial_call=True
+)
+def save_acl_callback(n, acl_text):
+    if 'user' not in session or not is_admin(session['user']['email']):
+        return "Unauthorized", "mt-2 text-danger fw-bold"
+    try:
+        new_acl = json.loads(acl_text)
+        save_acl(new_acl)
+        return "ACL Saved Successfully.", "mt-2 text-success fw-bold"
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON format: {e}", "mt-2 text-warning fw-bold"
+    except Exception as e:
+        return f"System Error: {e}", "mt-2 text-danger fw-bold"
+
+@app.callback(
+    Output({'type': 'kill-status', 'index': MATCH}, 'children'),
+    Input({'type': 'kill-btn', 'index': MATCH}, 'n_clicks'),
+    prevent_initial_call=True
+)
+def admin_kill_container(n, btn_id):
+    container_name = btn_id['index']
+    if 'user' not in session or not is_admin(session['user']['email']):
+        return "Unauthorized"
+    try:
+        c = docker_client.containers.get(container_name)
+        c.stop()
+        c.remove()
+        return "Terminated"
+    except Exception as e:
+        return "Failed"
+
+@app.callback(
+    Output('page-content', 'children'),
+    Input('url', 'pathname')
+)
+def display_page(pathname):
+    # Guard clause in case a layout request fires when logged out
+    if not has_request_context() or 'user' not in session:
+        return html.Div()
+
+    user_data = session['user']
+
+    # Route to the correct layout
+    if pathname == '/admin':
+        return get_admin_layout(user_data, pathname)
+    else:
+        return get_dashboard_layout(user_data, pathname)
 
 @server.route('/_auth_check')
 def auth_check():
