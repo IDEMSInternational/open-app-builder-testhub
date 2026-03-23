@@ -344,11 +344,11 @@ def serve_layout():
 
 app.layout = serve_layout
 
-# --- CALLBACKS ---
+#region --- CALLBACKS ---
 
 @app.callback(
     Output('deploy-status', 'children'),
-    Input('env-selector', 'value'), # <-- CHANGED THIS
+    Input('env-selector', 'value'),
     State('repo-selector', 'value'),
     prevent_initial_call=True
 )
@@ -638,6 +638,8 @@ def update_viewport(active_tab, n, env_url):
             
     return html.Div("Select tab")
 
+#region Admin Callbacks
+
 @app.callback(
     Output('acl-save-status', 'children'),
     Output('acl-save-status', 'className'),
@@ -780,6 +782,8 @@ def auth_check():
     resp.headers['X-Target-Host'] = container_name
     return resp
 
+#endregion
+#region Existing Build Preview
 def get_pat_for_repo(repo_url):
     """Finds the repo in REPOS, looks up its pat_env key, and fetches it from the environment."""
     for name, data in REPOS.items():
@@ -878,6 +882,10 @@ def get_gh_pages_url(repo_url):
     owner, repo_name = repo_path.split('/')
     return f"https://{owner.lower()}.github.io/{repo_name}/"
 
+#endregion
+#endregion
+#region Container Monitoring
+
 def is_container_running(email):
     try:
         container = docker_client.containers.get(sanitize_container_name(email))
@@ -936,6 +944,8 @@ def monitor_user_activity():
                 return f"An error occurred: {e}"
 
 threading.Thread(target=monitor_user_activity, daemon=True).start()
+
+#endregion
 
 if __name__ == '__main__':
     # SSL usually needed for Google OAuth, or set OAUTHLIB_INSECURE_TRANSPORT for dev
