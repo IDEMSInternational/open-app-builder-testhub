@@ -13,6 +13,7 @@ from datetime import datetime, UTC
 import threading
 from dotenv import load_dotenv
 import shlex
+import requests
 
 # --- CONFIGURATION ---
 load_dotenv()
@@ -257,7 +258,19 @@ def get_dashboard_layout(user, pathname="/"):
                         html.I(className="bi bi-exclamation-triangle-fill me-2"), 
                         "Force Rebuild"
                     ], id='btn-rebuild', color="warning", className="w-100 mb-2 shadow-sm text-dark"),
-                    html.Div(id='sync-status', className="text-muted small text-center")
+                    html.Div(id='sync-status', className="text-muted small text-center"),
+                    html.Hr(className="border-secondary mt-4"),
+                    html.H5("Pull Request Previews", className="mt-3 text-info"),
+                    html.P("Select a PR to view its live Firebase deployment. Clear to return to local container.", className="small text-muted mb-2"),
+                    dcc.Dropdown(
+                        id='pr-selector',
+                        placeholder="Select an open PR...",
+                        options=[],
+                        disabled=True,
+                        clearable=True,
+                        className="mb-2"
+                    ),
+                    html.Div(id='pr-url-status', className="text-muted small mt-2 fw-bold text-center")
                 ], className="p-4 h-100") # Padding for the panel
                 
             ], width=3, className="bg-dark-panel vh-100 p-0"), # Remove default Col padding
@@ -275,6 +288,7 @@ def get_dashboard_layout(user, pathname="/"):
                 )
             ], width=9, className="main-content ps-4")
         ], className="g-0"), # Remove gutter spacing for full-width split
+        dcc.Store(id='pr-url-store', data=None),
         dcc.Interval(id='log-poller', interval=2000, n_intervals=0, disabled=False) 
     ], fluid=True, className="p-0")])
 
@@ -395,6 +409,10 @@ def launch_container(repo_url):
             labels={"user_repo": repo_url},
             detach=True,
             remove=False,
+            # volumes={
+            #     f"yarn_cache_{safe_name}": {'bind': '/usr/local/share/.cache/yarn', 'mode': 'rw'},
+            #     f"angular_cache_{safe_name}": {'bind': '/app/.angular/cache', 'mode': 'rw'}
+            # },
             environment={
                 "DEPLOYMENT_PRIVATE_KEY": repo_key,
                 "NODE_OPTIONS": "--max-old-space-size=4608",
@@ -532,27 +550,30 @@ def sync_workflow(n):
 @app.callback(
     Output('tab-content', 'children'),
     [Input('viewport-tabs', 'active_tab'),
-     Input('log-poller', 'n_intervals')]
+     Input('log-poller', 'n_intervals'),
+     Input('pr-url-store', 'data')] # Added the Firebase Store as an input
 )
-def update_viewport(active_tab, n):
-    # Guard: Stop updates if not logged in
+def update_viewport(active_tab, n, firebase_pr_url):
     if 'user' not in session: return no_update
-
     user = session['user']
     USER_HEARTBEATS[user['email']] = time.time()
 
-    # This prevents the iframe from reloading/flashing.
     ctx = callback_context
-    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
+    
+    # Prevent iframe flashing from log polling
     if trigger_id == 'log-poller' and active_tab == 'tab-preview':
         return no_update
 
-    user = session['user']
     c_name = sanitize_container_name(user['email'])
     
     if active_tab == "tab-preview":
-        # Nginx will intercept '/preview/' and route it
-        # We add a random query param to bust iframe caching if the container restarts
+        if firebase_pr_url:
+            return html.Iframe(
+                src=firebase_pr_url, 
+                style={"width": "100%", "height": "80vh", "border": "none"}
+            )
+            
         return html.Iframe(
             src=f"/preview/?t={int(time.time())}", 
             style={"width": "100%", "height": "80vh", "border": "none"}
@@ -759,6 +780,83 @@ def auth_check():
     resp.headers['X-Target-Host'] = container_name
     return resp
 
+def get_pat_for_repo(repo_url):
+    """Finds the repo in REPOS, looks up its pat_env key, and fetches it from the environment."""
+    for name, data in REPOS.items():
+        if data.get('url') == repo_url:
+            env_key = data.get('pat_env', 'GITHUB_PAT') # Fallback to standard name
+            return os.environ.get(env_key)
+    return os.environ.get('GITHUB_PAT')
+
+def get_repo_path(repo_url):
+    """Converts 'https://github.com/IDEMSInternational/repo.git' to 'IDEMSInternational/repo'"""
+    clean_url = repo_url.replace(".git", "").rstrip("/")
+    parts = clean_url.split("/")
+    return f"{parts[-2]}/{parts[-1]}"
+
+@app.callback(
+    Output('pr-selector', 'options'),
+    Output('pr-selector', 'disabled'),
+    Output('pr-selector', 'value'),
+    Input('repo-selector', 'value'),
+    prevent_initial_call=True
+)
+def populate_pr_dropdown(repo_url):
+    pat = get_pat_for_repo(repo_url)
+    if not repo_url or not pat: return [], True, None
+    
+    headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github.v3+json"}
+    try:
+        res = requests.get(f"https://api.github.com/repos/{get_repo_path(repo_url)}/pulls?state=open", headers=headers)
+        if res.status_code == 200:
+            prs = res.json()
+            options = [{'label': f"#{pr['number']} - {pr['title']}", 'value': pr['number']} for pr in prs]
+            return options, False, None
+    except Exception as e:
+        print(f"GitHub API Error fetching PRs: {e}")
+        
+    return [], True, None
+
+
+@app.callback(
+    Output('pr-url-store', 'data'),
+    Output('pr-url-status', 'children'),
+    Input('pr-selector', 'value'),
+    State('repo-selector', 'value'),
+    prevent_initial_call=True
+)
+def resolve_pr_firebase_url(pr_number, repo_url):
+    if not pr_number or not repo_url: 
+        return None, "Showing Local Docker Build"
+    
+    pat = get_pat_for_repo(repo_url)
+    repo_path = get_repo_path(repo_url)
+    headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github.v3+json"}
+    
+    try:
+        # 1. Get the branch name for the selected PR
+        pr_res = requests.get(f"https://api.github.com/repos/{repo_path}/pulls/{pr_number}", headers=headers)
+        pr_res.raise_for_status()
+        pr_branch = pr_res.json()['head']['ref']
+        
+        # 2. Look up GitHub Deployments for that branch
+        deps_res = requests.get(f"https://api.github.com/repos/{repo_path}/deployments?ref={pr_branch}", headers=headers)
+        deps = deps_res.json()
+        
+        if deps:
+            # 3. Get the status of the most recent deployment to find the environment_url
+            statuses_res = requests.get(deps[0]['statuses_url'], headers=headers)
+            statuses = statuses_res.json()
+            
+            if statuses and statuses[0]['state'] == 'success':
+                firebase_url = statuses[0].get('environment_url')
+                return firebase_url, html.Span([html.I(className="bi bi-cloud-check-fill me-1"), "Connected to Firebase"], className="text-success")
+            elif statuses and statuses[0]['state'] in ['pending', 'in_progress']:
+                return None, html.Span([html.I(className="bi bi-hourglass-split me-1"), "Firebase build in progress..."], className="text-warning")
+                
+        return None, html.Span([html.I(className="bi bi-exclamation-triangle-fill me-1"), "No successful Firebase deployment found."], className="text-danger")
+    except Exception as e:
+        return None, f"API Error: {str(e)}"
 
 def is_container_running(email):
     try:
