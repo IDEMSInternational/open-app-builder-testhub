@@ -5,6 +5,7 @@ import re
 from flask import Flask, session, redirect, url_for, has_request_context, Response, request
 from authlib.integrations.flask_client import OAuth
 from dash import Dash, html, dcc, Input, Output, State, no_update, callback_context, MATCH
+from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
 import json
 from ansi2html import Ansi2HTMLConverter
@@ -14,6 +15,7 @@ import threading
 from dotenv import load_dotenv
 import shlex
 import requests
+import secrets
 
 # --- CONFIGURATION ---
 load_dotenv()
@@ -31,6 +33,32 @@ CONTAINER_STAGES = {}  # Stores current yarn/pm2 stage
 
 with open("repo_config.json", 'r') as json_file:
     REPOS =json.load(json_file)
+
+STATE_FILE = "testhub_state.json"
+
+class StateManager:
+    """A simple file-backed database to persist user preview states."""
+    @staticmethod
+    def read():
+        if not os.path.exists(STATE_FILE): return {}
+        try:
+            with open(STATE_FILE, 'r') as f: return json.load(f)
+        except: return {}
+
+    @staticmethod
+    def write(state):
+        with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=4)
+
+    @staticmethod
+    def get(email):
+        return StateManager.read().get(email, {})
+
+    @staticmethod
+    def update(email, **kwargs):
+        state = StateManager.read()
+        if email not in state: state[email] = {}
+        for k, v in kwargs.items(): state[email][k] = v
+        StateManager.write(state)
 
 # --- ACCESS CONTROL SETUP ---
 ACL_FILE = "access_control.json"
@@ -158,6 +186,36 @@ def logout():
         kill_user_resources(session['user']['email'])
     session.pop('user', None)
     return redirect('/')
+
+@server.route('/webhook/preview-ready', methods=['POST'])
+def webhook_preview_ready():
+    data = request.json
+    email = data.get('email')
+    token = data.get('token')
+    urls = data.get('urls', '')
+    status = data.get('status')
+
+    if not email or not token: return "Missing payload", 400
+
+    # 1. Security Check: Does the token match what we generated?
+    user_state = StateManager.get(email)
+    if user_state.get('webhook_token') != token:
+        return "Unauthorized: Invalid Token", 401
+
+    # 2. Parse the Firebase URL safely
+    final_url = None
+    if urls and status == 'success':
+        try:
+            # Firebase action often outputs a JSON array string
+            arr = json.loads(urls)
+            if isinstance(arr, list) and len(arr) > 0: final_url = arr[0]
+        except:
+            # Fallback if it's just a comma-separated string
+            final_url = urls.split(',')[0].replace('"', '').replace("'", "").strip()
+
+    # 3. Save the result to our local database
+    StateManager.update(email, status=status, preview_url=final_url)
+    return "OK", 200
 
 # --- COMPONENT LAYOUTS ---
 
@@ -469,86 +527,127 @@ def setup_container(email, repo_url):
 @app.callback(
     Output('sync-status', 'children'),
     Input('btn-sync', 'n_clicks'),
+    State('env-selector', 'value'),
+    State('repo-selector', 'value'),
     prevent_initial_call=True
 )
-def sync_workflow(n):
-    if 'user' not in session: return no_update
+def sync_workflow(n, env_value, repo_url):
+    if 'user' not in session or not env_value or not repo_url: return no_update
 
     user_email = session['user']['email']
-    token_data = session.get('oauth_token', {})
+    
+    # --- CLOUD SYNC LOGIC ---
+    if env_value == 'cloud':
+        pat = get_pat_for_repo(repo_url)
+        repo_path = get_repo_path(repo_url)
+        
+        # 1. Generate a secure, one-time use token
+        secure_token = secrets.token_urlsafe(16)
 
-    # 1. Construct the Application Credentials (credentials.json)
-    client_config = {
-        "client_id": GOOGLE_CLIENT_ID,
-        "project_id": "open-app-builder",
-        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-        "token_uri": "https://oauth2.googleapis.com/token",
-        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-        "client_secret": GOOGLE_CLIENT_SECRET,
-        "redirect_uris": ["http://localhost"] 
-    }
-
-    creds_data = {
-        "web": client_config,
-        "installed": client_config
-    }
-
-    # 2. Adjust token timestamp formatting (Google Node scripts often expect ms)
-    if 'expires_at' in token_data:
-        token_data['expiry_date'] = token_data['expires_at'] * 1000
-
-    creds_json = json.dumps(creds_data)
-    token_json = json.dumps(token_data)
-
-    try:
-        c = docker_client.containers.get(sanitize_container_name(user_email))
-
-        # 3. Use shlex.quote to safely escape the JSON strings for the bash shell
-        safe_creds = shlex.quote(creds_json)
-        safe_token = shlex.quote(token_json)
-
-        # 4. Construct the unified command.
-        # - Creates the config directory
-        # - Writes both credentials.json and token.json
-        # - Redirects standard output and standard error (2>&1) directly to Docker's PID 1 stream
-        cmd = f"""
-        mkdir -p /app/packages/scripts/config && \
-        echo {safe_creds} > /app/packages/scripts/config/credentials.json && \
-        echo {safe_token} > /app/packages/scripts/config/token.json && \
-        echo "--- Starting Yarn Workflow Sync ---" > /proc/1/fd/1 && \
-        yarn workflow sync > /proc/1/fd/1 2>&1 && \
-        echo "--- Stopping PM2 Wrapper ---" > /proc/1/fd/1 && \
-        npx pm2 stop preview_app > /proc/1/fd/1 2>&1 && \
-        echo "--- Clearing Orphaned Port 4200 ---" > /proc/1/fd/1 && \
-        fuser -k 4200/tcp > /proc/1/fd/1 2>&1 || true && \
-        echo "--- Restarting Preview Server ---" > /proc/1/fd/1 && \
-        npx pm2 start preview_app > /proc/1/fd/1 2>&1
-        """
-
-        # 5. Execute synchronously (detach=False is the default). 
-        # This blocks the UI slightly but guarantees we get the actual exit code.
-        CONTAINER_STAGES[user_email] = "Syncing Workflow..."
-        exec_log = c.exec_run(["/bin/sh", "-c", cmd])
-
-        # 6. Return improved contextual feedback based on the exact exit code
-        if exec_log.exit_code == 0:
-            CONTAINER_STAGES[user_email] = "App Running (Synced)"
-            return html.Span(
-                [html.I(className="bi bi-check-circle-fill me-1"), "Sync completed successfully. See logs."], 
-                className="text-success fw-bold"
-            )
+        webhook_url = f"https://{DOMAIN}/webhook/preview-ready"
+        
+        # 2. Clear old state immediately so the UI shows Loading
+        StateManager.update(
+            user_email, 
+            status="pending", 
+            preview_url=None, 
+            webhook_token=secure_token
+        )
+        
+        # 3. Dispatch the GitHub Action
+        url = f"https://api.github.com/repos/{repo_path}/actions/workflows/synced-preview.yml/dispatches"
+        headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github.v3+json"}
+        data = {
+            "ref": "main",
+            "inputs": {
+                "user_email": user_email,
+                "webhook_url": webhook_url,
+                "webhook_token": secure_token
+            }
+        }
+        
+        res = requests.post(url, headers=headers, json=data)
+        if res.status_code == 204:
+            return html.Span([html.I(className="bi bi-cloud-upload me-1"), "Cloud build started!"], className="text-success fw-bold")
         else:
-            CONTAINER_STAGES[user_email] = "Sync Failed"
+            return html.Span(f"GitHub Error: {res.text}", className="text-danger fw-bold")
+
+    # --- LOCAL DOCKER SYNC LOGIC ---
+    elif env_value == 'local':
+        token_data = session.get('oauth_token', {})
+
+        # 1. Construct the Application Credentials (credentials.json)
+        client_config = {
+            "client_id": GOOGLE_CLIENT_ID,
+            "project_id": "open-app-builder",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uris": ["http://localhost"] 
+        }
+
+        creds_data = {
+            "web": client_config,
+            "installed": client_config
+        }
+
+        # 2. Adjust token timestamp formatting (Google Node scripts often expect ms)
+        if 'expires_at' in token_data:
+            token_data['expiry_date'] = token_data['expires_at'] * 1000
+
+        creds_json = json.dumps(creds_data)
+        token_json = json.dumps(token_data)
+
+        try:
+            c = docker_client.containers.get(sanitize_container_name(user_email))
+
+            # 3. Use shlex.quote to safely escape the JSON strings for the bash shell
+            safe_creds = shlex.quote(creds_json)
+            safe_token = shlex.quote(token_json)
+
+            # 4. Construct the unified command.
+            # - Creates the config directory
+            # - Writes both credentials.json and token.json
+            # - Redirects standard output and standard error (2>&1) directly to Docker's PID 1 stream
+            cmd = f"""
+            mkdir -p /app/packages/scripts/config && \
+            echo {safe_creds} > /app/packages/scripts/config/credentials.json && \
+            echo {safe_token} > /app/packages/scripts/config/token.json && \
+            echo "--- Starting Yarn Workflow Sync ---" > /proc/1/fd/1 && \
+            yarn workflow sync > /proc/1/fd/1 2>&1 && \
+            echo "--- Stopping PM2 Wrapper ---" > /proc/1/fd/1 && \
+            npx pm2 stop preview_app > /proc/1/fd/1 2>&1 && \
+            echo "--- Clearing Orphaned Port 4200 ---" > /proc/1/fd/1 && \
+            fuser -k 4200/tcp > /proc/1/fd/1 2>&1 || true && \
+            echo "--- Restarting Preview Server ---" > /proc/1/fd/1 && \
+            npx pm2 start preview_app > /proc/1/fd/1 2>&1
+            """
+
+            # 5. Execute synchronously (detach=False is the default). 
+            # This blocks the UI slightly but guarantees we get the actual exit code.
+            CONTAINER_STAGES[user_email] = "Syncing Workflow..."
+            exec_log = c.exec_run(["/bin/sh", "-c", cmd])
+
+            # 6. Return improved contextual feedback based on the exact exit code
+            if exec_log.exit_code == 0:
+                CONTAINER_STAGES[user_email] = "App Running (Synced)"
+                return html.Span(
+                    [html.I(className="bi bi-check-circle-fill me-1"), "Sync completed successfully. See logs."], 
+                    className="text-success fw-bold"
+                )
+            else:
+                CONTAINER_STAGES[user_email] = "Sync Failed"
+                return html.Span(
+                    [html.I(className="bi bi-exclamation-triangle-fill me-1"), f"Sync failed (Exit code: {exec_log.exit_code}). Check logs tab."], 
+                    className="text-danger fw-bold"
+                )
+
+        except Exception as e:
             return html.Span(
-                [html.I(className="bi bi-exclamation-triangle-fill me-1"), f"Sync failed (Exit code: {exec_log.exit_code}). Check logs tab."], 
+                [html.I(className="bi bi-x-circle-fill me-1"), f"System Error: {str(e)}"], 
                 className="text-danger fw-bold"
             )
-
-    except Exception as e:
-        return html.Span(
-            [html.I(className="bi bi-x-circle-fill me-1"), f"System Error: {str(e)}"], 
-            className="text-danger fw-bold"
-        )
 
 @app.callback(
     Output('tab-content', 'children'),
@@ -562,23 +661,38 @@ def update_viewport(active_tab, n, env_url):
     USER_HEARTBEATS[user['email']] = time.time()
 
     ctx = callback_context
-    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
+    triggered_ids = [t['prop_id'] for t in ctx.triggered] if ctx.triggered else []
     
-    # Prevent iframe flashing from log polling
-    if trigger_id == 'log-poller' and active_tab == 'tab-preview':
+    # 1. If the user changed tabs, OR the Firebase URL just arrived, we update.
+    if 'viewport-tabs.active_tab' in triggered_ids or 'env-url-store.data' in triggered_ids:
+        pass # Allow execution to fall through to the rendering logic below
+        
+    # 2. If it's a routine background tick from the poller, block it so the iframe doesn't flash
+    elif 'log-poller.n_intervals' in triggered_ids and active_tab == 'tab-preview':
         return no_update
 
     c_name = sanitize_container_name(user['email'])
     
     if active_tab == "tab-preview":
         if env_url == 'local':
-            return html.Iframe(src=f"/preview/?t={int(time.time())}", style={"width": "100%", "height": "80vh", "border": "none"})
-
-        if env_url:
-            return html.Iframe(src=env_url, style={"width": "100%", "height": "80vh", "border": "none"})
-
-        return html.Div("Select an environment to preview.")
-    
+            return html.Iframe(
+                src=f"/preview/?t={int(time.time())}", 
+                style={"width": "100%", "height": "80vh", "border": "none"}
+            )
+        elif env_url:
+            # By passing the env_url as the 'key', React will destroy the old iframe 
+            # and build a completely fresh one, guaranteeing it loads the new site!
+            return html.Iframe(
+                src=env_url, 
+                key=env_url, 
+                style={"width": "100%", "height": "80vh", "border": "none"}
+            )
+        else:
+            return html.Div(
+                [html.I(className="bi bi-cloud-arrow-up display-4 text-muted mb-3"), 
+                 html.P("Waiting for preview...", className="text-muted")], 
+                className="d-flex flex-column justify-content-center align-items-center h-100 w-100"
+            )
     elif active_tab == "tab-logs":
         try:
             c = docker_client.containers.get(c_name)
@@ -808,13 +922,12 @@ def get_repo_path(repo_url):
 def populate_env_dropdown(repo_url):
     if not repo_url: return [], True, None
     
-    # 1. Base Options
     options = [
         {'label': '🟢 Main Branch (Live)', 'value': 'main'},
-        {'label': '💻 Build Draft', 'value': 'local'}
+        {'label': '☁️ Cloud Draft (Fast Sync)', 'value': 'cloud'},
+        {'label': '💻 Local Draft (Docker)', 'value': 'local'}
     ]
     
-    # 2. Fetch PRs
     pat = get_pat_for_repo(repo_url)
     if pat:
         headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github.v3+json"}
@@ -827,32 +940,59 @@ def populate_env_dropdown(repo_url):
         except Exception as e:
             print(f"GitHub API Error fetching PRs: {e}")
             
-    # Default to 'main' branch so we don't start Docker unnecessarily!
     return options, False, 'main'
-
 
 @app.callback(
     Output('env-url-store', 'data'),
     Output('env-status', 'children'),
     Input('env-selector', 'value'),
+    Input('log-poller', 'n_intervals'),
     State('repo-selector', 'value'),
     prevent_initial_call=True
 )
-def resolve_env_url(env_value, repo_url):
+def resolve_env_url(env_value, n_intervals, repo_url):
     if not env_value or not repo_url: return None, ""
     
+    ctx = callback_context
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
+
+    # Protect API Limits: Only process poller ticks if we are waiting for Cloud/PRs
+    if trigger_id == 'log-poller':
+        if env_value in ['main', 'local']: 
+            raise PreventUpdate
+        if n_intervals % 5 != 0: # Throttle to every 10 seconds
+            raise PreventUpdate
+
     if env_value == 'main':
-        gh_pages = get_gh_pages_url(repo_url)
-        return gh_pages, html.Span([html.I(className="bi bi-globe me-1"), "Showing Live Main Branch"], className="text-success")
+        return get_gh_pages_url(repo_url), html.Span([html.I(className="bi bi-globe me-1"), "Showing Live Main Branch"], className="text-success")
         
     if env_value == 'local':
-        return 'local', html.Span([html.I(className="bi bi-pc-display me-1"), "Showing Docker Build"], className="text-info")
-    
-    # Otherwise, it's a PR number
+        return 'local', html.Span([html.I(className="bi bi-pc-display me-1"), "Showing Local Docker Build"], className="text-info")
+
+    # Fetch PAT & Repo
     pat = get_pat_for_repo(repo_url)
     repo_path = get_repo_path(repo_url)
     headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github.v3+json"}
     
+    # --- CLOUD ENVIRONMENT RESOLUTION ---
+    if env_value == 'cloud':
+        email = session['user']['email']
+        state = StateManager.get(email)
+        
+        status = state.get('status')
+        url = state.get('preview_url')
+        
+        if not status:
+            return None, html.Span("Click Sync to build Cloud Draft", className="text-info")
+            
+        if status == 'success' and url:
+            return url, html.Span([html.I(className="bi bi-check-circle-fill me-1"), "Cloud Preview Ready"], className="text-success")
+        elif status == 'failure':
+            return None, html.Span([html.I(className="bi bi-exclamation-triangle-fill me-1"), "Build Failed. Please check data/logs."], className="text-danger")
+        else:
+            return None, html.Span([html.I(className="bi bi-hourglass-split me-1"), "Building in Cloud..."], className="text-warning")
+
+    # --- PR RESOLUTION ---
     try:
         pr_res = requests.get(f"https://api.github.com/repos/{repo_path}/pulls/{env_value}", headers=headers)
         pr_branch = pr_res.json()['head']['ref']
@@ -950,4 +1090,4 @@ threading.Thread(target=monitor_user_activity, daemon=True).start()
 if __name__ == '__main__':
     # SSL usually needed for Google OAuth, or set OAUTHLIB_INSECURE_TRANSPORT for dev
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1' 
-    app.run(debug=False, port=8050, host='0.0.0.0')
+    app.run(debug=True, port=8050, host='0.0.0.0')
