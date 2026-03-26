@@ -28,16 +28,12 @@ NETWORK_NAME = os.environ.get("DOCKER_NETWORK_NAME", "app-net")
 DOMAIN = os.environ.get("DOMAIN", None)
 
 HEARTBEAT_TIMEOUT = 10  # Seconds to wait before killing container (buffer for 2s poll)
-USER_HEARTBEATS = {}
-CONTAINER_STAGES = {}  # Stores current yarn/pm2 stage
 
 with open("repo_config.json", 'r') as json_file:
     REPOS =json.load(json_file)
 
 STATE_FILE = "testhub_state.json"
-
 class StateManager:
-    """A simple file-backed database to persist user preview states."""
     @staticmethod
     def read():
         if not os.path.exists(STATE_FILE): return {}
@@ -50,14 +46,32 @@ class StateManager:
         with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=4)
 
     @staticmethod
-    def get(email):
+    def get_user(email):
         return StateManager.read().get(email, {})
 
     @staticmethod
-    def update(email, **kwargs):
+    def update_user(email, **kwargs):
+        """Updates top-level user data (like heartbeats)"""
         state = StateManager.read()
-        if email not in state: state[email] = {}
+        if email not in state: state[email] = {"repos": {}}
         for k, v in kwargs.items(): state[email][k] = v
+        StateManager.write(state)
+
+    @staticmethod
+    def get_repo(email, repo_url):
+        user_data = StateManager.get_user(email)
+        return user_data.get("repos", {}).get(repo_url, {})
+
+    @staticmethod
+    def update_repo(email, repo_url, **kwargs):
+        """Updates data for a specific repository"""
+        state = StateManager.read()
+        if email not in state: state[email] = {"repos": {}}
+        if "repos" not in state[email]: state[email]["repos"] = {}
+        if repo_url not in state[email]["repos"]: state[email]["repos"][repo_url] = {}
+        
+        for k, v in kwargs.items(): 
+            state[email]["repos"][repo_url][k] = v
         StateManager.write(state)
 
 # --- ACCESS CONTROL SETUP ---
@@ -197,24 +211,34 @@ def webhook_preview_ready():
 
     if not email or not token: return "Missing payload", 400
 
-    # 1. Security Check: Does the token match what we generated?
-    user_state = StateManager.get(email)
-    if user_state.get('webhook_token') != token:
-        return "Unauthorized: Invalid Token", 401
+    user_state = StateManager.get_user(email)
+    target_repo = None
+    
+    # Scan the user's repos to find which one initiated this webhook
+    for repo_url, repo_data in user_state.get('repos', {}).items():
+        if repo_data.get('webhook_token') == token:
+            target_repo = repo_url
+            break
 
-    # 2. Parse the Firebase URL safely
+    if not target_repo:
+        return "Unauthorized: Invalid or Expired Token", 401
+
+    # Parse the Firebase URL safely
     final_url = None
     if urls and status == 'success':
         try:
-            # Firebase action often outputs a JSON array string
             arr = json.loads(urls)
             if isinstance(arr, list) and len(arr) > 0: final_url = arr[0]
         except:
-            # Fallback if it's just a comma-separated string
             final_url = urls.split(',')[0].replace('"', '').replace("'", "").strip()
 
-    # 3. Save the result to our local database
-    StateManager.update(email, status=status, preview_url=final_url)
+    StateManager.update_repo(
+        email, 
+        target_repo, 
+        status=status, 
+        preview_url=final_url,
+        last_updated=time.time()
+    )
     return "OK", 200
 
 # --- COMPONENT LAYOUTS ---
@@ -460,7 +484,7 @@ def launch_container(repo_url):
 
     try:
         kill_user_resources(user['email'], remove=True)
-        CONTAINER_STAGES[user['email']] = "Container Created (Waiting)"
+        StateManager.update_repo(user['email'], repo_url, docker_stage="Container Created (Waiting)")
         docker_client.containers.run(
             DOCKER_IMAGE,
             entrypoint="/bin/sh",
@@ -499,13 +523,13 @@ def setup_container(email, repo_url):
         check = c.exec_run(["/bin/sh", "-c", "[ -d './idems_app/deployments' ]"])
         
         if check.exit_code != 0:
-            CONTAINER_STAGES[email] = "Importing Repository..."
+            StateManager.update_repo(email, repo_url, docker_stage="Importing Repository...")
             c.exec_run(["/bin/sh", "-c", f"echo '--- Importing Repository: {repo_url} ---' > /proc/1/fd/1"])
             
             # Run import and stream output to Docker logs
             c.exec_run(["/bin/sh", "-c", f"yarn workflow deployment import {repo_url} -y > /proc/1/fd/1 2>&1"])
 
-        CONTAINER_STAGES[email] = "Starting Preview Server..."
+        StateManager.update_repo(email, repo_url, docker_stage="Starting Preview Server...")
         c.exec_run(["/bin/sh", "-c", "echo '--- Starting Preview Server (PM2) ---' > /proc/1/fd/1"])
         
         # 2. Start PM2.
@@ -518,7 +542,7 @@ def setup_container(email, repo_url):
             "-- start:docker > /proc/1/fd/1 2>&1"
         )
         c.exec_run(["/bin/sh", "-c", start_cmd])
-        CONTAINER_STAGES[email] = "App Running"
+        StateManager.update_repo(email, repo_url, docker_stage="App Running")
 
     except Exception as e:
         print(f"Setup thread error for {email}: {e}")
@@ -547,11 +571,13 @@ def sync_workflow(n, env_value, repo_url):
         webhook_url = f"https://{DOMAIN}/webhook/preview-ready"
         
         # 2. Clear old state immediately so the UI shows Loading
-        StateManager.update(
-            user_email, 
+        StateManager.update_repo(
+            user_email,
+            repo_url,
             status="pending", 
             preview_url=None, 
-            webhook_token=secure_token
+            webhook_token=secure_token,
+            last_updated=None
         )
         
         # 3. Dispatch the GitHub Action
@@ -626,18 +652,18 @@ def sync_workflow(n, env_value, repo_url):
 
             # 5. Execute synchronously (detach=False is the default). 
             # This blocks the UI slightly but guarantees we get the actual exit code.
-            CONTAINER_STAGES[user_email] = "Syncing Workflow..."
+            StateManager.update_repo(user_email, repo_url, docker_stage="Syncing Workflow...")
             exec_log = c.exec_run(["/bin/sh", "-c", cmd])
 
             # 6. Return improved contextual feedback based on the exact exit code
             if exec_log.exit_code == 0:
-                CONTAINER_STAGES[user_email] = "App Running (Synced)"
+                StateManager.update_repo(user_email, repo_url, docker_stage="App Running (Synced)")
                 return html.Span(
                     [html.I(className="bi bi-check-circle-fill me-1"), "Sync completed successfully. See logs."], 
                     className="text-success fw-bold"
                 )
             else:
-                CONTAINER_STAGES[user_email] = "Sync Failed"
+                StateManager.update_repo(user_email, repo_url, docker_stage="Sync Failed")
                 return html.Span(
                     [html.I(className="bi bi-exclamation-triangle-fill me-1"), f"Sync failed (Exit code: {exec_log.exit_code}). Check logs tab."], 
                     className="text-danger fw-bold"
@@ -657,8 +683,7 @@ def sync_workflow(n, env_value, repo_url):
 )
 def update_viewport(active_tab, n, env_url):
     if 'user' not in session: return no_update
-    user = session['user']
-    USER_HEARTBEATS[user['email']] = time.time()
+    StateManager.update_user(session['user']['email'], last_heartbeat=time.time())
 
     ctx = callback_context
     triggered_ids = [t['prop_id'] for t in ctx.triggered] if ctx.triggered else []
@@ -671,7 +696,7 @@ def update_viewport(active_tab, n, env_url):
     elif 'log-poller.n_intervals' in triggered_ids and active_tab == 'tab-preview':
         return no_update
 
-    c_name = sanitize_container_name(user['email'])
+    c_name = sanitize_container_name(session['user']['email'])
     
     if active_tab == "tab-preview":
         if env_url == 'local':
@@ -801,6 +826,8 @@ def update_admin_table(n):
     rows = []
     now = time.time()
 
+    state = StateManager.read()
+
     try:
         # Fast query, no stats=True
         for c in docker_client.containers.list(all=True, filters={"network": NETWORK_NAME}):
@@ -808,12 +835,12 @@ def update_admin_table(n):
             
             repo = c.labels.get("user_repo", "None")
             status_badge = dbc.Badge(c.status, color="success" if c.status == "running" else "secondary")
-            
-            # Reverse-engineer the email from the container name to look up our local state
-            email_match = next((email for email in USER_HEARTBEATS.keys() if sanitize_container_name(email) == c.name), c.name)
+
+            email_match = next((m for m in state if sanitize_container_name(m) == c.name), None)
+            user_data = state.get(email_match, {}) if email_match else {}
             
             # 1. Calculate Heartbeat Health
-            last_seen = USER_HEARTBEATS.get(email_match)
+            last_seen = user_data.get('last_heartbeat')
             if last_seen is None:
                 hb_text = "Idle / Offline"
                 hb_color = "text-muted"
@@ -830,7 +857,8 @@ def update_admin_table(n):
                     hb_color = "text-success"
 
             # 2. Get Current Stage
-            stage = CONTAINER_STAGES.get(email_match, "Unknown")
+            repo_info = user_data.get("repos", {}).get(repo, {})
+            stage = repo_info.get("docker_stage", "Unknown")
             if c.status != "running":
                 stage = "Stopped"
 
@@ -977,18 +1005,25 @@ def resolve_env_url(env_value, n_intervals, repo_url):
     # --- CLOUD ENVIRONMENT RESOLUTION ---
     if env_value == 'cloud':
         email = session['user']['email']
-        state = StateManager.get(email)
+        repo_state = StateManager.get_repo(email, repo_url)
         
-        status = state.get('status')
-        url = state.get('preview_url')
+        status = repo_state.get('status')
+        url = repo_state.get('preview_url')
+        last_updated = repo_state.get('last_updated')
         
         if not status:
             return None, html.Span("Click Sync to build Cloud Draft", className="text-info")
             
         if status == 'success' and url:
-            return url, html.Span([html.I(className="bi bi-check-circle-fill me-1"), "Cloud Preview Ready"], className="text-success")
+            time_str = time.strftime('%H:%M', time.localtime(last_updated)) if last_updated else "Unknown"
+            
+            return url, html.Span([
+                html.I(className="bi bi-check-circle-fill me-1"), 
+                f"Cloud Preview Ready (Built at {time_str})"
+            ], className="text-success")
+            
         elif status == 'failure':
-            return None, html.Span([html.I(className="bi bi-exclamation-triangle-fill me-1"), "Build Failed. Please check data/logs."], className="text-danger")
+            return None, html.Span([html.I(className="bi bi-exclamation-triangle-fill me-1"), "Build Failed. Please check logs."], className="text-danger")
         else:
             return None, html.Span([html.I(className="bi bi-hourglass-split me-1"), "Building in Cloud..."], className="text-warning")
 
@@ -1033,56 +1068,72 @@ def is_container_running(email):
     except:
         return False
 
-
 def monitor_user_activity():
-    """Background loop to clean up containers for users who closed the tab."""
+    """
+    Background loop to clean up Docker resources for inactive users.
+    1. Stops containers if the heartbeat is lost (> HEARTBEAT_TIMEOUT).
+    2. Fully removes containers that have been 'exited' for more than 24 hours.
+    """
     while True:
         time.sleep(5)  # Check every 5 seconds
-        counter = 0
         now = time.time()
-        
-        # Stop Unused Containers after HEARTBEAT_TIMEOUT seconds
-        for email, last_seen in list(USER_HEARTBEATS.items()):
-            if last_seen == None:
-                continue
-            if now - last_seen > HEARTBEAT_TIMEOUT:
-                print(f"Heartbeat lost for {email}. Stopping container...")
-                kill_user_resources(email, remove=False)
-                USER_HEARTBEATS[email] = None
-        
-        if counter > 3:
-            counter += 1
-            continue
-        
-        # Remove Unused Containers after 1 day
-        for email, last_seen in list(USER_HEARTBEATS.items()):
-            if last_seen is not None:
-                continue
 
-            try:
-                container = docker_client.containers.get(sanitize_container_name(email))
-                if container.status == "exited":
-                    finished_at_str = container.attrs['State']['FinishedAt']
-                    finished_at = datetime.fromisoformat(finished_at_str.replace('Z', '+00:00'))
-                    current_time = datetime.now(UTC)
-                    stopped_duration = current_time - finished_at
-                    
-                    if stopped_duration > 24*60*60:
-                        container.remove()
-                        # Remove email record
-                        USER_HEARTBEATS.pop(email, None)
+        # Load the entire state at the start of the tick
+        full_state = StateManager.read()
 
-                elif container.status == "running":
-                    USER_HEARTBEATS.pop(email, None)
-                    
-                else:
-                    return f"Container '{sanitize_container_name(email)}' has an unexpected status: {container.status}"
+        for email, user_data in full_state.items():
+            last_seen = user_data.get('last_heartbeat')
+            c_name = sanitize_container_name(email)
 
-            except docker.errors.NotFound:
-                USER_HEARTBEATS.pop(email, None)
-            except Exception as e:
-                return f"An error occurred: {e}"
+            # --- PHASE 1: HEARTBEAT EXPIRATION (Stop Container) ---
+            if last_seen and (now - last_seen > HEARTBEAT_TIMEOUT):
+                try:
+                    # Check if this user actually has a container before trying to kill
+                    container = docker_client.containers.get(c_name)
 
+                    if container.status == "running":
+                        print(f"Reaper: Heartbeat lost for {email}. Stopping {c_name}...")
+                        container.stop()
+
+                        # Update state: Set heartbeat to None and stage to Stopped
+                        # We find which repo was active by looking for the one with a docker_stage
+                        for repo_url, repo_info in user_data.get("repos", {}).items():
+                            if repo_info.get("docker_stage") and repo_info.get("docker_stage") != "Stopped":
+                                StateManager.update_repo(email, repo_url, docker_stage="Stopped")
+
+                        StateManager.update_user(email, last_heartbeat=None)
+                except docker.errors.NotFound:
+                    # Container already gone, just clean up state
+                    StateManager.update_user(email, last_heartbeat=None)
+                except Exception as e:
+                    print(f"Reaper Error (Stop Phase): {e}")
+
+            # --- PHASE 2: LONG-TERM CLEANUP (Remove Container) ---
+            # If the user has been offline for a long time, remove the container to save disk space
+            if last_seen is None:
+                try:
+                    container = docker_client.containers.get(c_name)
+                    if container.status == "exited":
+                        finished_at_str = container.attrs['State']['FinishedAt']
+                        # Convert Docker ISO timestamp to datetime object
+                        finished_at = datetime.fromisoformat(finished_at_str.replace('Z', '+00:00'))
+                        current_time = datetime.now(UTC)
+
+                        # Remove if exited for more than 24 hours
+                        if (current_time - finished_at).total_seconds() > 24 * 3600:
+                            print(f"Reaper: Removing stale container {c_name} (Exited > 24h)")
+                            container.remove()
+
+                            # Clean up docker_stage for all repos for this user
+                            for repo_url in user_data.get("repos", {}).keys():
+                                StateManager.update_repo(email, repo_url, docker_stage=None)
+
+                except docker.errors.NotFound:
+                    pass 
+                except Exception as e:
+                    print(f"Reaper Error (Remove Phase): {e}")
+
+# Start the daemon thread
 threading.Thread(target=monitor_user_activity, daemon=True).start()
 
 #endregion
