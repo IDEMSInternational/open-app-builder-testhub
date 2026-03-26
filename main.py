@@ -1015,11 +1015,11 @@ def resolve_env_url(env_value, n_intervals, repo_url):
             return None, html.Span("Click Sync to build Cloud Draft", className="text-info")
             
         if status == 'success' and url:
-            time_str = time.strftime('%H:%M', time.localtime(last_updated)) if last_updated else "Unknown"
+            time_str = time.strftime('%H:%M', time.gmtime(last_updated)) if last_updated else "Unknown"
             
             return url, html.Span([
                 html.I(className="bi bi-check-circle-fill me-1"), 
-                f"Cloud Preview Ready (Built at {time_str})"
+                f"Cloud Preview Ready (Built at {time_str}UTC)"
             ], className="text-success")
             
         elif status == 'failure':
