@@ -34,45 +34,56 @@ with open("repo_config.json", 'r') as json_file:
 
 STATE_FILE = "testhub_state.json"
 class StateManager:
-    @staticmethod
-    def read():
-        if not os.path.exists(STATE_FILE): return {}
-        try:
-            with open(STATE_FILE, 'r') as f: return json.load(f)
-        except: return {}
+    _lock = threading.Lock()
 
     @staticmethod
-    def write(state):
+    def _read_unsafe():
+        if not os.path.exists(STATE_FILE): return {}
+        try:
+            with open(STATE_FILE, 'r') as f:
+                content = f.read()
+                if not content: return {}
+                return json.loads(content)
+        except (IOError, json.JSONDecodeError):
+            # Consider logging this error
+            return {}
+
+    @staticmethod
+    def _write_unsafe(state):
         with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=4)
 
     @staticmethod
     def get_user(email):
-        return StateManager.read().get(email, {})
+        with StateManager._lock:
+            return StateManager._read_unsafe().get(email, {})
 
     @staticmethod
     def update_user(email, **kwargs):
         """Updates top-level user data (like heartbeats)"""
-        state = StateManager.read()
-        if email not in state: state[email] = {"repos": {}}
-        for k, v in kwargs.items(): state[email][k] = v
-        StateManager.write(state)
+        with StateManager._lock:
+            state = StateManager._read_unsafe()
+            if email not in state: state[email] = {"repos": {}}
+            for k, v in kwargs.items(): state[email][k] = v
+            StateManager._write_unsafe(state)
 
     @staticmethod
     def get_repo(email, repo_url):
-        user_data = StateManager.get_user(email)
-        return user_data.get("repos", {}).get(repo_url, {})
+        with StateManager._lock:
+            user_data = StateManager._read_unsafe().get(email, {})
+            return user_data.get("repos", {}).get(repo_url, {})
 
     @staticmethod
     def update_repo(email, repo_url, **kwargs):
         """Updates data for a specific repository"""
-        state = StateManager.read()
-        if email not in state: state[email] = {"repos": {}}
-        if "repos" not in state[email]: state[email]["repos"] = {}
-        if repo_url not in state[email]["repos"]: state[email]["repos"][repo_url] = {}
-        
-        for k, v in kwargs.items(): 
-            state[email]["repos"][repo_url][k] = v
-        StateManager.write(state)
+        with StateManager._lock:
+            state = StateManager._read_unsafe()
+            if email not in state: state[email] = {"repos": {}}
+            if "repos" not in state[email]: state[email]["repos"] = {}
+            if repo_url not in state[email]["repos"]: state[email]["repos"][repo_url] = {}
+            
+            for k, v in kwargs.items(): 
+                state[email]["repos"][repo_url][k] = v
+            StateManager._write_unsafe(state)
 
 # --- ACCESS CONTROL SETUP ---
 ACL_FILE = "access_control.json"
