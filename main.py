@@ -1138,10 +1138,10 @@ def monitor_user_activity():
                         container.stop()
 
                         # Update state: Set heartbeat to None and stage to Stopped
-                        # We find which repo was active by looking for the one with a docker_stage
-                        for repo_url, repo_info in user_data.get("repos", {}).items():
-                            if repo_info.get("docker_stage") and repo_info.get("docker_stage") != "Stopped":
-                                StateManager.update_repo(email, repo_url, docker_stage="Stopped")
+                        # We get the active repo from the container's label
+                        active_repo_url = container.labels.get("user_repo")
+                        if active_repo_url:
+                            StateManager.update_repo(email, active_repo_url, docker_stage="Stopped")
 
                         StateManager.update_user(email, last_heartbeat=None)
                 except docker.errors.NotFound:
