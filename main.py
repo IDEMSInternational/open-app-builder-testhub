@@ -45,7 +45,6 @@ class StateManager:
                 if not content: return {}
                 return json.loads(content)
         except (IOError, json.JSONDecodeError):
-            # Consider logging this error
             return {}
 
     @staticmethod
@@ -84,6 +83,12 @@ class StateManager:
             for k, v in kwargs.items(): 
                 state[email]["repos"][repo_url][k] = v
             StateManager._write_unsafe(state)
+
+    @staticmethod
+    def read():
+        """Public, thread-safe access to the entire state."""
+        with StateManager._lock:
+            return StateManager._read_unsafe()
 
 # --- ACCESS CONTROL SETUP ---
 ACL_FILE = "access_control.json"
@@ -248,7 +253,8 @@ def webhook_preview_ready():
         target_repo, 
         status=status, 
         preview_url=final_url,
-        last_updated=time.time()
+        last_updated=time.time(),
+        webhook_token=None
     )
     return "OK", 200
 
@@ -599,7 +605,11 @@ def sync_workflow(n, env_value, repo_url):
         if res.status_code == 204:
             return html.Span([html.I(className="bi bi-cloud-upload me-1"), "Cloud build started!"], className="text-success fw-bold")
         else:
-            return html.Span(f"GitHub Error: {res.text}", className="text-danger fw-bold")
+            try:
+                error_message = res.json().get("message", res.text)
+            except json.JSONDecodeError:
+                error_message = res.text
+            return html.Span(f"GitHub Error ({res.status_code}): {error_message}", className="text-danger fw-bold")
 
     # --- LOCAL DOCKER SYNC LOGIC ---
     elif env_value == 'local':
@@ -765,7 +775,7 @@ def update_viewport(active_tab, env_url, env_value, n, repo_url):
                 """
 
                 return html.Iframe(srcDoc=full_html, style={"width": "100%", "height": "80vh", "border": "none"})
-            except:
+            except docker.errors.NotFound:
                 return html.Div("No local container running.", className="p-4 text-muted")
 
         # Case B: Cloud/PR/Main - Redirect to GitHub
