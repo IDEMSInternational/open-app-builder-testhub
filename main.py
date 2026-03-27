@@ -240,7 +240,7 @@ def webhook_preview_ready():
         try:
             arr = json.loads(urls)
             if isinstance(arr, list) and len(arr) > 0: final_url = arr[0]
-        except:
+        except json.JSONDecodeError:
             final_url = urls.split(',')[0].replace('"', '').replace("'", "").strip()
 
     StateManager.update_repo(
