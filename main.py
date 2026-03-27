@@ -297,19 +297,11 @@ def get_dashboard_layout(user, pathname="/"):
     allowed_repos = get_allowed_repos(user.get('email', ''))
     
     # Current Repo Logic (Existing)
-    current_repo = None
-    if user and docker_client:
-        try:
-            c = docker_client.containers.get(sanitize_container_name(user['email']))
-            current_repo = c.labels.get("user_repo")
+    user_state = StateManager.get_user(session['user']['email'])
+    current_repo = user_state.get('active_repo')
 
-            if current_repo not in [v['url'] for v in allowed_repos.values()]:
-                current_repo = None
-            c.start()
-        except docker.errors.NotFound:
-            pass # No container running, keep selection empty
-        except Exception as e:
-            print(f"Error checking container state: {e}")
+    if current_repo not in [v['url'] for v in allowed_repos.values()]:
+        current_repo = None
 
     navbar = get_navbar(user, pathname)
 
@@ -678,104 +670,109 @@ def sync_workflow(n, env_value, repo_url):
 @app.callback(
     Output('tab-content', 'children'),
     [Input('viewport-tabs', 'active_tab'),
-     Input('log-poller', 'n_intervals'),
-     Input('env-url-store', 'data')]
+     Input('env-url-store', 'data'),
+     Input('env-selector', 'value'), # Added to know which logs to show
+     Input('log-poller', 'n_intervals')],
+    State('repo-selector', 'value')
 )
-def update_viewport(active_tab, n, env_url):
+def update_viewport(active_tab, env_url, env_value, n, repo_url):
     if 'user' not in session: return no_update
-    StateManager.update_user(session['user']['email'], last_heartbeat=time.time())
+    
+    # Unified Heartbeat
+    email = session['user']['email']
+    StateManager.update_user(email, last_heartbeat=time.time())
 
     ctx = callback_context
     triggered_ids = [t['prop_id'] for t in ctx.triggered] if ctx.triggered else []
     
-    # 1. If the user changed tabs, OR the Firebase URL just arrived, we update.
-    if 'viewport-tabs.active_tab' in triggered_ids or 'env-url-store.data' in triggered_ids:
-        pass # Allow execution to fall through to the rendering logic below
-        
-    # 2. If it's a routine background tick from the poller, block it so the iframe doesn't flash
-    elif 'log-poller.n_intervals' in triggered_ids and active_tab == 'tab-preview':
+    # Priority check: If tab changed or URL arrived, ignore the poller's 'no_update' rule
+    is_priority = 'viewport-tabs.active_tab' in triggered_ids or 'env-url-store.data' in triggered_ids
+    if not is_priority and 'log-poller.n_intervals' in triggered_ids and active_tab == "tab-preview":
         return no_update
 
-    c_name = sanitize_container_name(session['user']['email'])
-    
+    # --- TAB: PREVIEW ---
     if active_tab == "tab-preview":
-        if env_url == 'local':
-            return html.Iframe(
-                src=f"/preview/?t={int(time.time())}", 
-                style={"width": "100%", "height": "80vh", "border": "none"}
-            )
+        if env_value == 'local':
+            return html.Iframe(src=f"/preview/?t={int(time.time())}", style={"width": "100%", "height": "80vh", "border": "none"})
         elif env_url:
-            # By passing the env_url as the 'key', React will destroy the old iframe 
-            # and build a completely fresh one, guaranteeing it loads the new site!
-            return html.Iframe(
-                src=env_url, 
-                key=env_url, 
-                style={"width": "100%", "height": "80vh", "border": "none"}
-            )
+            return html.Iframe(src=env_url, key=env_url, style={"width": "100%", "height": "80vh", "border": "none"})
         else:
-            return html.Div(
-                [html.I(className="bi bi-cloud-arrow-up display-4 text-muted mb-3"), 
-                 html.P("Waiting for preview...", className="text-muted")], 
-                className="d-flex flex-column justify-content-center align-items-center h-100 w-100"
-            )
+            return html.Div([
+                html.I(className="bi bi-cloud-arrow-up display-4 text-muted mb-3"), 
+                html.P("Waiting for environment to be ready...", className="text-muted")
+            ], className="d-flex flex-column justify-content-center align-items-center h-100")
+
+    # --- TAB: LOGS ---
     elif active_tab == "tab-logs":
-        try:
-            c = docker_client.containers.get(c_name)
-            # Fetch last 100 lines for context
-            logs = c.logs(tail=200).decode('utf-8')
-            
-            # 1. Clean up cursor movement codes (A, K, G), keep colors (m)
-            cleaned_logs = re.sub(r'\x1b\[\d*[A-KG]', '', logs)
-
-            # 2. Convert logs to HTML body
-            log_html = conv.convert(cleaned_logs, full=False)
-
-            # 3. Inject JS for "Sticky Scrolling"
-            # Logic: 
-            # - On load, if 'wasAtBottom' (from sessionStorage) is true, scroll down.
-            # - On scroll, update 'wasAtBottom' based on position.
-            full_html = f"""
-            <html>
-            <head>
-                <style>body {{ background-color: #0d1117; color: #c9d1d9; font-family: monospace; white-space: pre-wrap; }}</style>
-            </head>
-            <body>
-                {log_html}
-                <script>
-                    const body = document.body;
-                    const html = document.documentElement;
-                    
-                    // 1. Check if we should scroll to bottom (default to true on first load)
-                    const wasAtBottom = sessionStorage.getItem('log_pos') !== 'false';
-
-                    if (wasAtBottom) {{
-                        window.scrollTo(0, body.scrollHeight);
-                    }} else {{
-                        // Restore previous scroll position if needed (optional complexity, usually just staying put is enough)
-                        const lastScroll = sessionStorage.getItem('scroll_val');
-                        if (lastScroll) window.scrollTo(0, lastScroll);
-                    }}
-
-                    // 2. Listen for scroll events to update state
-                    window.addEventListener('scroll', () => {{
-                        // Tolerance of 50px
-                        const distanceToBottom = body.scrollHeight - window.innerHeight - window.scrollY;
-                        const isAtBottom = distanceToBottom < 50;
+        # Case A: Local Docker Logs (Existing Logic)
+        if env_value == 'local':
+            c_name = sanitize_container_name(email)
+            try:
+                c = docker_client.containers.get(c_name)
+                logs = c.logs(tail=200).decode('utf-8')
+                cleaned_logs = re.sub(r'\x1b\[\d*[A-KG]', '', logs)
+                log_html = conv.convert(cleaned_logs, full=False)
+                
+                # Inject JS for "Sticky Scrolling"
+                # Logic: 
+                # - On load, if 'wasAtBottom' (from sessionStorage) is true, scroll down.
+                # - On scroll, update 'wasAtBottom' based on position.
+                full_html = f"""
+                <html>
+                <head>
+                    <style>body {{ background-color: #0d1117; color: #c9d1d9; font-family: monospace; white-space: pre-wrap; }}</style>
+                </head>
+                <body>
+                    {log_html}
+                    <script>
+                        const body = document.body;
+                        const html = document.documentElement;
                         
-                        sessionStorage.setItem('log_pos', isAtBottom);
-                        sessionStorage.setItem('scroll_val', window.scrollY);
-                    }});
-                </script>
-            </body>
-            </html>
-            """
-            
-            return html.Iframe(srcDoc=full_html, style={"width": "100%", "height": "80vh", "border": "none"})
+                        // 1. Check if we should scroll to bottom (default to true on first load)
+                        const wasAtBottom = sessionStorage.getItem('log_pos') !== 'false';
 
-        except Exception as e:
-            return html.Div(f"Log Error: {e}")
+                        if (wasAtBottom) {{
+                            window.scrollTo(0, body.scrollHeight);
+                        }} else {{
+                            // Restore previous scroll position if needed (optional complexity, usually just staying put is enough)
+                            const lastScroll = sessionStorage.getItem('scroll_val');
+                            if (lastScroll) window.scrollTo(0, lastScroll);
+                        }}
+
+                        // 2. Listen for scroll events to update state
+                        window.addEventListener('scroll', () => {{
+                            // Tolerance of 50px
+                            const distanceToBottom = body.scrollHeight - window.innerHeight - window.scrollY;
+                            const isAtBottom = distanceToBottom < 50;
+                            
+                            sessionStorage.setItem('log_pos', isAtBottom);
+                            sessionStorage.setItem('scroll_val', window.scrollY);
+                        }});
+                    </script>
+                </body>
+                </html>
+                """
+
+                return html.Iframe(srcDoc=full_html, style={"width": "100%", "height": "80vh", "border": "none"})
+            except:
+                return html.Div("No local container running.", className="p-4 text-muted")
+
+        # Case B: Cloud/PR/Main - Redirect to GitHub
+        else:
+            repo_path = get_repo_path(repo_url) if repo_url else ""
+            actions_url = f"https://github.com/{repo_path}/actions"
             
-    return html.Div("Select tab")
+            return html.Div([
+                html.I(className="bi bi-github display-1 text-muted mb-4"),
+                html.H4("Cloud Build Logs", className="text-white"),
+                html.P("Live logs for Cloud builds are hosted on GitHub Actions.", className="text-muted mb-4"),
+                dbc.Button([
+                    html.I(className="bi bi-box-arrow-up-right me-2"),
+                    "View Build Progress on GitHub"
+                ], href=actions_url, target="_blank", color="primary", size="lg")
+            ], className="d-flex flex-column justify-content-center align-items-center h-100 p-5 text-center")
+
+    return html.Div("Select a tab")
 
 #region Admin Callbacks
 
@@ -945,7 +942,6 @@ def get_repo_path(repo_url):
     Output('env-selector', 'disabled'),
     Output('env-selector', 'value'),
     Input('repo-selector', 'value'),
-    prevent_initial_call=True
 )
 def populate_env_dropdown(repo_url):
     if not repo_url: return [], True, None
@@ -968,7 +964,14 @@ def populate_env_dropdown(repo_url):
         except Exception as e:
             print(f"GitHub API Error fetching PRs: {e}")
             
-    return options, False, 'main'
+    email = session['user']['email']
+    repo_state = StateManager.get_repo(email, repo_url)
+    
+    # Default to their last used environment (local/cloud), 
+    # falling back to 'main' if it's their first time.
+    last_env = repo_state.get('last_env', 'main')
+    
+    return options, False, last_env
 
 @app.callback(
     Output('env-url-store', 'data'),
@@ -976,7 +979,6 @@ def populate_env_dropdown(repo_url):
     Input('env-selector', 'value'),
     Input('log-poller', 'n_intervals'),
     State('repo-selector', 'value'),
-    prevent_initial_call=True
 )
 def resolve_env_url(env_value, n_intervals, repo_url):
     if not env_value or not repo_url: return None, ""
@@ -1057,6 +1059,35 @@ def get_gh_pages_url(repo_url):
     owner, repo_name = repo_path.split('/')
     return f"https://{owner.lower()}.github.io/{repo_name}/"
 
+@app.callback(
+    Output('env-url-store', 'data', allow_duplicate=True),
+    Input('repo-selector', 'value'),
+    prevent_initial_call=True
+)
+def clear_url_on_repo_change(repo_url):
+    return None
+
+@app.callback(
+    Output('repo-selector', 'className'), # Using a dummy output (className)
+    Input('repo-selector', 'value'),
+    prevent_initial_call=True
+)
+def sync_active_repo_to_state(repo_url):
+    """Saves the currently selected repository to the user's global state."""
+    if 'user' in session and repo_url:
+        StateManager.update_user(session['user']['email'], active_repo=repo_url)
+    return no_update
+
+@app.callback(
+    Output('env-selector', 'className'), # Dummy output
+    Input('env-selector', 'value'),
+    State('repo-selector', 'value'),
+    prevent_initial_call=True
+)
+def save_env_choice_to_state(env_value, repo_url):
+    if 'user' in session and repo_url and env_value:
+        StateManager.update_repo(session['user']['email'], repo_url, last_env=env_value)
+    return no_update
 #endregion
 #endregion
 #region Container Monitoring
@@ -1141,4 +1172,4 @@ threading.Thread(target=monitor_user_activity, daemon=True).start()
 if __name__ == '__main__':
     # SSL usually needed for Google OAuth, or set OAUTHLIB_INSECURE_TRANSPORT for dev
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1' 
-    app.run(debug=True, port=8050, host='0.0.0.0')
+    app.run(debug=False, port=8050, host='0.0.0.0')
