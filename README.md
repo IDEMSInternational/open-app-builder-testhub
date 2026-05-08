@@ -39,12 +39,12 @@ The system relies on a `.env` file at the root of the project to manage secrets,
 
 #### Configuration Variables
 
-* **`GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET**`: Credentials from Google Cloud Console. Requires `openid`, `email`, `profile`, `drive.readonly`, and `drive.metadata.readonly` scopes.
+* **`GOOGLE_CLIENT_ID`** / **`GOOGLE_CLIENT_SECRET`**: Credentials from Google Cloud Console. Requires `openid`, `email`, `profile`, `drive.readonly`, and `drive.metadata.readonly` scopes.
 * **`FLASK_SECRET_KEY`**: A cryptographic string used by Flask to sign session cookies.
 * **`DOMAIN`**: The base domain for routing and Let's Encrypt SSL generation.
 * **`CERTBOT_EMAIL`**: Email registered with Let's Encrypt for SSL notifications.
 * **`USE_LOCAL_CA`**: Set to `1` when testing locally to bypass strict ACME SSL challenges.
-* **`GITHUB_PAT`**: A GitHub Fine-Grained Access Token. Under "Repository permissions", it requires **Actions (Read/Write)**, **Deployments (Read-only)**, and **Pull Requests (Read-only)** to dispatch cloud builds and fetch deployment preview URLs.
+* **`GITHUB_PAT`**: A GitHub Fine-Grained Access Token. Under "Repository permissions", it requires **Actions (Read/Write)**, **Deployments (Read-only)**, and **Pull Requests (Read-only)** to dispatch cloud builds and fetch deployment preview URLs. Multiple other GitHub PATs may be added for by-repo permissions, see [Repository Configuration](#repository-configuration-repo_configjson).
 
 #### Required Token Permissions
 
@@ -55,12 +55,8 @@ When creating a Fine-Grained Access Token for TestHub, you should restrict it to
   *Why?* The code makes a `POST` request to `/actions/workflows/synced-preview.yml/dispatches` to trigger the "Cloud Draft".
 * **Deployments**: `Read-only`   
   *Why?* To resolve Cloud Preview URLs, the code makes `GET` requests to the repository's deployments and statuses endpoints.
-
-
 * **Pull requests**: `Read-only`    
   *Why?* The code makes a `GET` request to fetch open pull requests to populate the environment selector dropdown.
-
-
 * **Metadata**: `Read-only`    
   *Note:* GitHub automatically enforces this as a mandatory baseline for all fine-grained tokens to allow the app to read the repository's basic existence.
 
